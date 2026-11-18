@@ -69,7 +69,16 @@ Stack: **React 19 · Vite 8 · TypeScript 7 · Tailwind 4 · Express · PostgreS
 
 ---
 
-## Migrazioni PostgreSQL (`migrations/`)
+## Documentazione operativa (`docs/`)
+
+La documentazione funzionale, gli audit e le specifiche di sviluppo vivono in `docs/` e sono parte integrante del progetto:
+
+- `docs/ACTIONFLOW_FULL_AUDIT.md` — audit completo del repository.
+- `docs/ACTIONFLOW_END_TO_END_AUDIT.md` — audit end-to-end (video → accredito → wallet → prelievo → pagamento).
+- `docs/ACTIONFLOW_SECURITY_AUDIT.md` — audit di sicurezza e integrità.
+- `docs/INCARICO_SVILUPPO.md` — incarico di sviluppo per il completamento delle specifiche finanziarie automatiche.
+
+Prima di ogni intervento, leggere le specifiche aggiornate in `docs/` e verificare la conformità del codice. Ogni modifica deve aggiornare la documentazione ufficiale.
 
 * `001` – `010`: Schema `core`, double-entry a 4 bucket (`PENDING`, `SETTLED`, `WITHDRAWABLE`, `RESERVED`), reset timezone-aware, postback verificati S2S, reputazione fornitori, batch settlement con haircut, `v_treasury_solvency` e `request_payout_atomic`.
 * `011_geo_country_lock_and_provider_ranking.sql`: Lock persistente `market_country`, associazione deterministica `core.resolve_country_tier_zone(p_country)` e vista `core.v_prioritized_providers` (da applicare separatamente previa autorizzazione su Neon).
