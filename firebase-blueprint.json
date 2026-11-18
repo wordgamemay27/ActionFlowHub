@@ -1,0 +1,127 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Authenticated non-financial user profile synced with Firestore (financial balances live exclusively in PostgreSQL).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "telegramId": {
+          "type": "number"
+        },
+        "username": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "firstName": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "points": {
+          "type": "number"
+        },
+        "completedTasksCount": {
+          "type": "number"
+        },
+        "walletAddress": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "tier": {
+          "type": "string",
+          "enum": ["TIER 1", "TIER 2", "TIER 3", "VIP ELITE"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "telegramId", "points", "completedTasksCount", "tier", "createdAt", "updatedAt"]
+    },
+    "UserTransaction": {
+      "title": "UserTransaction",
+      "description": "Read-only financial ledger mirror; client writes are strictly denied.",
+      "type": "object",
+      "properties": {
+        "txId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["TASK_CLAIM", "WITHDRAWAL", "DEPOSIT", "REFERRAL", "BONUS", "PENALTY", "AIRDROP_CLAIM", "STARS_PURCHASE", "TURBO_ACTIVATION"]
+        },
+        "amountPoints": {
+          "type": "number"
+        },
+        "amountTon": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "APPROVED", "COMPLETED", "FAILED", "CANCELLED", "PROCESSING"]
+        },
+        "details": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["txId", "userId", "type", "amountPoints", "status", "createdAt"]
+    },
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Trusted administrator lookup document.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserAccount"
+      },
+      "description": "Private non-financial user profile keyed by Firebase Auth UID; points/completedTasksCount/tier are immutable from clients."
+    },
+    "/users/{userId}/transactions/{txId}": {
+      "schema": {
+        "$ref": "#/entities/UserTransaction"
+      },
+      "description": "Read-only transaction records; client creates/updates/deletes are denied."
+    },
+    "/admins/{adminId}": {
+      "schema": {
+        "$ref": "#/entities/AdminUser"
+      },
+      "description": "Read-only admin registry managed out-of-band."
+    }
+  }
+}
