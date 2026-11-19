@@ -721,6 +721,22 @@ export function createExpressApp() {
       });
     }
 
+    // Verifica stato fornitore (escludi QUARANTINE/BANNED)
+    if (dbPool) {
+      try {
+        const pr = await dbPool.query(
+          `SELECT status FROM core.provider_reputation WHERE provider_id = $1`,
+          [providerId]
+        );
+        const status = pr.rows[0]?.status;
+        if (!status || status === 'QUARANTINE' || status === 'BANNED') {
+          return res.status(403).json({ ok: false, error: 'PROVIDER_BLOCKED_BY_REPUTATION' });
+        }
+      } catch {
+        // tabella non esiste → ignora (compatibilità)
+      }
+    }
+
     const clickId =
       String(req.body?.clickId || resolveClickIdFromQuery(trackingUrl || '') || '').trim() ||
       `clk_${authUser.userId}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;

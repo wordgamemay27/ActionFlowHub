@@ -1,0 +1,26 @@
+-- Migration 015 — Correzione copertura finanziaria per asset (NON APPLICATA)
+-- Corregge: complete_payout_atomic, release_settled_to_withdrawable_for_user,
+--           execute_batch_settlement
+-- Principio: la copertura (capacity) e' calcolata SOLO per il singolo asset
+-- del prelievo/settlement. Nessuna liquidita' TON copre USDT, SOL, PI, ecc.
+--
+-- Le funzioni originali (migrazioni 010, 012) usavano:
+--   SELECT COALESCE(SUM(points_equivalent_capacity), 0) FROM core.treasury_vault;
+-- (aggregato su tutti gli asset). Questo e' il bug cross-asset.
+--
+-- Fix: sostituire con:
+--   SELECT COALESCE(points_equivalent_capacity, 0) FROM core.treasury_vault WHERE asset = <asset>;
+--
+-- Inoltre:
+-- - reserved_buffer_percent (15%) applicato per-asset, non aggregato.
+-- - disbursed_usd cumulativo per-asset.
+-- - release_settled: capacity per asset, non SUM.
+-- - execute_batch_settlement: aggiunge capacity all'asset specifico del settlement,
+--   non solo USDT.
+--
+-- NOTA: le funzioni SQL originali devono essere riprodotte con CREATE OR REPLACE
+--       includendo il fix per-asset. Il patch e' da applicare in una sessione
+--       con DATABASE_URL disponibile, dopo verifica statica.
+--       Nessun saldo viene modificato da questa migrazione.
+--       Nessun movimento finanziario viene generato.
+SELECT 1; -- placeholder, nessuna operazione DDL distruttiva
