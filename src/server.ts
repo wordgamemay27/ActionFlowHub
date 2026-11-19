@@ -1243,6 +1243,29 @@ export function createExpressApp() {
       .update(JSON.stringify({ uid, numericPoints, cryptoAsset, cleanAddress }))
       .digest('hex');
     const clientRequestId = String(req.body?.requestId || req.header('x-request-id') || '').trim();
+
+    // Idempotenza persistente: cerca payout esistente con stesso fingerprint
+    if (dbPool) {
+      try {
+        const existing = await dbPool.query(
+          `SELECT request_id, idempotency_key FROM core.payout_requests
+           WHERE user_id = $1 AND request_fingerprint = $2
+           ORDER BY created_at DESC LIMIT 1`,
+          [uid, payloadFingerprint]
+        );
+        if (existing.rows.length > 0) {
+          const row = existing.rows[0];
+          return res.json({
+            ok: true,
+            idempotent: true,
+            payout: { request_id: row.request_id, idempotency_key: row.idempotency_key },
+            message: 'Payout esistente restituito (idempotenza persistente).',
+          });
+        }
+      } catch {
+        // colonna non esiste → ignora (migrazione non applicata)
+      }
+    }
     let idemKey: string;
     if (clientRequestId.length >= 8) {
       const stored = payoutIdempotencyFingerprints.get(clientRequestId);
