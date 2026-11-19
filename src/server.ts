@@ -243,6 +243,8 @@ export function createExpressApp() {
     message: { ok: false, error: 'WEBHOOK_RATE_LIMIT_EXCEEDED' },
   });
 
+  const perProviderRateLimit = new Map<string, { count: number; resetAt: number }>();
+
   app.use('/api', generalApiLimiter);
 
   function requireAdmin(req: Request, res: Response, next: () => void) {
@@ -806,6 +808,19 @@ export function createExpressApp() {
       return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_WEBHOOK' });
     }
 
+    // Anti-replay: timestamp firmato (finestra 300s).
+    const webhookTimestampRaw =
+      req.header('x-webhook-timestamp') ||
+      String(req.query.timestamp || req.body?.timestamp || '');
+    const webhookTimestamp = Number(webhookTimestampRaw);
+    if (!Number.isFinite(webhookTimestamp) || webhookTimestamp <= 0) {
+      return res.status(400).json({ ok: false, error: 'WEBHOOK_TIMESTAMP_REQUIRED' });
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (Math.abs(nowSec - webhookTimestamp) > 300) {
+      return res.status(400).json({ ok: false, error: 'WEBHOOK_TIMESTAMP_EXPIRED' });
+    }
+
     const statusParam = String(req.query.status || req.body?.status || 'CONFIRMED')
       .trim()
       .toUpperCase();
@@ -877,6 +892,24 @@ export function createExpressApp() {
     }
 
     const rawPoints = Math.round(payoutRaw * 100);
+
+    // Rate limit per-fornitore (10 req/min per provider)
+    {
+      const now = Date.now();
+      const windowMs = 60 * 1000;
+      const maxPerProvider = 10;
+      const key = `provider:${provider}`;
+      const entry = (perProviderRateLimit.get(key) || { count: 0, resetAt: now + windowMs });
+      if (now > entry.resetAt) {
+        entry.count = 0;
+        entry.resetAt = now + windowMs;
+      }
+      entry.count += 1;
+      perProviderRateLimit.set(key, entry);
+      if (entry.count > maxPerProvider) {
+        return res.status(429).json({ ok: false, error: 'PROVIDER_RATE_LIMIT_EXCEEDED' });
+      }
+    }
     const ledgerRes = await LedgerService.recordVerifiedInteractionPostback({
       eventId: txId,
       partnerId: provider,
@@ -1076,13 +1109,11 @@ export function createExpressApp() {
       });
     }
 
-    const idemKey = String(req.body?.idempotencyKey || req.header('x-idempotency-key') || '').trim();
-    if (idemKey.length < 4) {
-      return res.status(400).json({
-        ok: false,
-        error: 'IDEMPOTENCY_KEY_REQUIRED',
-      });
-    }
+    // Idempotency key generata lato server. Il client puo' passare requestId per retry.
+    const clientRequestId = String(req.body?.requestId || req.header('x-request-id') || '').trim();
+    const idemKey = clientRequestId.length >= 8
+      ? clientRequestId
+      : `payout_${uid}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
 
     const ALLOWED_CRYPTO_ASSETS = new Set([
       'TON',
