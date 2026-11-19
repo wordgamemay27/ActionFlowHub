@@ -208,7 +208,7 @@ export function createExpressApp() {
       crossOriginEmbedderPolicy: false,
     })
   );
-  app.use(express.json({ limit: '64kb' }));
+  app.use(express.json({ limit: '64kb', verify: (req: any, _res, buf) => { req.rawBody = buf; } }));
   app.use(express.static(path.resolve(process.cwd(), 'public')));
 
   const generalApiLimiter = rateLimit({
@@ -244,6 +244,7 @@ export function createExpressApp() {
   });
 
   const perProviderRateLimit = new Map<string, { count: number; resetAt: number }>();
+  const payoutIdempotencyFingerprints = new Map<string, string>();
 
   app.use('/api', generalApiLimiter);
 
@@ -800,25 +801,40 @@ export function createExpressApp() {
     const webhookSecret = process.env.WEBHOOK_SECRET || '';
     const providedSecret =
       req.header('x-webhook-secret') || String(req.query.secret || req.body?.secret || '');
-    if (!webhookSecret || !safeTokenEquals(providedSecret, webhookSecret)) {
+    const providedSignature = req.header('x-webhook-signature') || '';
+    const webhookTimestampRaw =
+      req.header('x-webhook-timestamp') ||
+      String(req.query.timestamp || req.body?.timestamp || '');
+    const webhookTimestamp = Number(webhookTimestampRaw);
+
+    // HMAC con timestamp (nuova firma): signature = HMAC-SHA256(secret, timestamp + "." + rawBody)
+    let hmacValid = false;
+    if (providedSignature && Number.isFinite(webhookTimestamp) && webhookTimestamp > 0) {
+      const rawBody = (req as any).rawBody
+        ? (req as any).rawBody.toString('utf8')
+        : JSON.stringify(req.body ?? {});
+      const message = `${webhookTimestamp}.${rawBody}`;
+      const expected = crypto.createHmac('sha256', webhookSecret).update(message).digest('hex');
+      try {
+        hmacValid =
+          providedSignature.length === expected.length &&
+          crypto.timingSafeEqual(Buffer.from(providedSignature, 'hex'), Buffer.from(expected, 'hex'));
+      } catch {
+        hmacValid = false;
+      }
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (Math.abs(nowSec - webhookTimestamp) > 300) hmacValid = false;
+    }
+
+    // Firma legacy (solo secret) — transizione controllata
+    const legacyValid = !providedSignature && !!webhookSecret && safeTokenEquals(providedSecret, webhookSecret);
+
+    if (!webhookSecret || (!hmacValid && !legacyValid)) {
       return res.status(401).json({ ok: false, error: 'WEBHOOK_AUTH_REQUIRED' });
     }
 
     if (!dbPool) {
       return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_WEBHOOK' });
-    }
-
-    // Anti-replay: timestamp firmato (finestra 300s).
-    const webhookTimestampRaw =
-      req.header('x-webhook-timestamp') ||
-      String(req.query.timestamp || req.body?.timestamp || '');
-    const webhookTimestamp = Number(webhookTimestampRaw);
-    if (!Number.isFinite(webhookTimestamp) || webhookTimestamp <= 0) {
-      return res.status(400).json({ ok: false, error: 'WEBHOOK_TIMESTAMP_REQUIRED' });
-    }
-    const nowSec = Math.floor(Date.now() / 1000);
-    if (Math.abs(nowSec - webhookTimestamp) > 300) {
-      return res.status(400).json({ ok: false, error: 'WEBHOOK_TIMESTAMP_EXPIRED' });
     }
 
     const statusParam = String(req.query.status || req.body?.status || 'CONFIRMED')
@@ -898,15 +914,37 @@ export function createExpressApp() {
       const now = Date.now();
       const windowMs = 60 * 1000;
       const maxPerProvider = 10;
-      const key = `provider:${provider}`;
-      const entry = (perProviderRateLimit.get(key) || { count: 0, resetAt: now + windowMs });
-      if (now > entry.resetAt) {
-        entry.count = 0;
-        entry.resetAt = now + windowMs;
+      const windowStart = new Date(Math.floor(now / windowMs) * windowMs).toISOString();
+      let count = 0;
+      if (dbPool) {
+        try {
+          const r = await dbPool.query(
+            `INSERT INTO core.provider_rate_limit (provider, window_start, request_count)
+             VALUES ($1, $2, 1)
+             ON CONFLICT (provider, window_start)
+             DO UPDATE SET request_count = core.provider_rate_limit.request_count + 1
+             RETURNING request_count`,
+            [provider, windowStart]
+          );
+          count = r.rows[0]?.request_count || 1;
+        } catch {
+          // Fallback in-memory se tabella non esiste
+          const key = `provider:${provider}`;
+          const entry = perProviderRateLimit.get(key) || { count: 0, resetAt: now + windowMs };
+          if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + windowMs; }
+          entry.count += 1;
+          perProviderRateLimit.set(key, entry);
+          count = entry.count;
+        }
+      } else {
+        const key = `provider:${provider}`;
+        const entry = perProviderRateLimit.get(key) || { count: 0, resetAt: now + windowMs };
+        if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + windowMs; }
+        entry.count += 1;
+        perProviderRateLimit.set(key, entry);
+        count = entry.count;
       }
-      entry.count += 1;
-      perProviderRateLimit.set(key, entry);
-      if (entry.count > maxPerProvider) {
+      if (count > maxPerProvider) {
         return res.status(429).json({ ok: false, error: 'PROVIDER_RATE_LIMIT_EXCEEDED' });
       }
     }
@@ -1109,12 +1147,6 @@ export function createExpressApp() {
       });
     }
 
-    // Idempotency key generata lato server. Il client puo' passare requestId per retry.
-    const clientRequestId = String(req.body?.requestId || req.header('x-request-id') || '').trim();
-    const idemKey = clientRequestId.length >= 8
-      ? clientRequestId
-      : `payout_${uid}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
-
     const ALLOWED_CRYPTO_ASSETS = new Set([
       'TON',
       'SOL',
@@ -1165,6 +1197,30 @@ export function createExpressApp() {
           asset: cryptoAsset,
         });
       }
+    }
+
+    const payloadFingerprint = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ uid, numericPoints, cryptoAsset, cleanAddress }))
+      .digest('hex');
+    const clientRequestId = String(req.body?.requestId || req.header('x-request-id') || '').trim();
+    let idemKey: string;
+    if (clientRequestId.length >= 8) {
+      const stored = payoutIdempotencyFingerprints.get(clientRequestId);
+      if (stored) {
+        const [storedUid, storedFp] = stored.split(':');
+        if (storedUid !== String(uid)) {
+          return res.status(403).json({ ok: false, error: 'IDEMPOTENCY_KEY_USER_MISMATCH' });
+        }
+        if (storedFp !== payloadFingerprint) {
+          return res.status(409).json({ ok: false, error: 'IDEMPOTENCY_KEY_PAYLOAD_MISMATCH' });
+        }
+      }
+      payoutIdempotencyFingerprints.set(clientRequestId, `${uid}:${payloadFingerprint}`);
+      idemKey = clientRequestId;
+    } else {
+      idemKey = crypto.randomUUID();
+      payoutIdempotencyFingerprints.set(idemKey, `${uid}:${payloadFingerprint}`);
     }
 
     const reqId = `payout_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
