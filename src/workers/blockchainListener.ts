@@ -438,7 +438,7 @@ export async function checkSolanaDeposits(): Promise<void> {
       if (await isTxProcessed(sigInfo.signature)) continue;
 
       const parsedTx = await solConnection.getParsedTransaction(sigInfo.signature, {
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 1,
         commitment: 'finalized',
       });
       if (!parsedTx || !parsedTx.meta) continue;

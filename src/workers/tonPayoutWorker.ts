@@ -180,17 +180,24 @@ export class TonPayoutWorker {
         ],
       });
 
-      // Attesa conferma on-chain reale (seqno avanzato + verifica hash transazione)
+      // Attesa conferma on-chain reale: verifica transazione specifica (destinatario + importo)
       let confirmedTxHash: string | null = null;
+      const expectedNano = Math.round(Number(input.amountTon) * 1e9);
+      const expectedDest = (input.destinationWallet || '').trim();
       for (let attempt = 0; attempt < CONFIRMATION_POLL_ATTEMPTS; attempt++) {
         await sleep(CONFIRMATION_POLL_DELAY_MS);
         const seqnoCurrent = await openedWallet.getSeqno().catch(() => seqnoBefore);
         if (seqnoCurrent > seqnoBefore) {
           const txs = await client
-            .getTransactions(wallet.address, { limit: 5 })
+            .getTransactions(wallet.address, { limit: 20 })
             .catch(() => []);
           for (const tx of txs) {
-            if (tx.outMessagesCount > 0) {
+            if (tx.outMessagesCount <= 0) continue;
+            // Verifica destinatario e importo nella prima out-message
+            const outMsg = tx.outMessages?.get(0) as any;
+            const destAddr = outMsg?.info?.dest?.toString?.() || '';
+            const amountNano = Number(outMsg?.info?.value?.coins || 0);
+            if (destAddr === expectedDest && Math.abs(amountNano - expectedNano) <= 1000) {
               confirmedTxHash = tx.hash().toString('hex');
               break;
             }

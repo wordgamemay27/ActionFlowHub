@@ -142,6 +142,16 @@ export class MultiAssetPayoutWorker {
 
   async dispatchApprovedPayout(input: MultiAssetDispatchInput): Promise<MultiAssetDispatchResult> {
     const asset = String(input.cryptoAsset || '').trim().toUpperCase();
+    // Asset senza verifica indipendente: non auto-completare
+    const independentlyVerifiable = asset === 'TON' || asset === 'SOL';
+    if (!independentlyVerifiable) {
+      return {
+        ok: false,
+        requestId: String(input.requestId || '').trim(),
+        asset,
+        error: 'REQUIRES_RECONCILIATION: asset non verificabile indipendentemente',
+      };
+    }
     const requestId = String(input.requestId || '').trim();
     const dest = String(input.destinationWallet || '').trim();
     const points = Number(input.points || Math.round((Number(input.amountUsd) || 0) * 100));
@@ -458,7 +468,7 @@ export class MultiAssetPayoutWorker {
           },
           body: JSON.stringify({
             requestId,
-            provider: asset.replace('CASH_', ''),
+            provider: (asset as string).replace('CASH_', ''),
             recipient: recipientTarget,
             currency: 'USD',
             amountUsd: Number(input.amountUsd),
