@@ -712,6 +712,16 @@ export function createExpressApp() {
       .toUpperCase();
     const activityCategory = ALLOWED_CATEGORIES.has(rawCat) ? rawCat : 'OTHER';
     const trackingUrl = req.body?.trackingUrl ? String(req.body.trackingUrl).trim() : null;
+    if (trackingUrl) {
+      try {
+        const u = new URL(trackingUrl);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+          return res.status(400).json({ ok: false, error: 'INVALID_TRACKING_URL_PROTOCOL' });
+        }
+      } catch {
+        return res.status(400).json({ ok: false, error: 'INVALID_TRACKING_URL' });
+      }
+    }
     const expectedGrossUsd = Number(req.body?.expectedGrossUsd || 0);
 
     if (!providerId || !taskId) {
@@ -904,6 +914,8 @@ export function createExpressApp() {
         return res.status(400).json({ ok: false, error: 'TX_ID_REQUIRED_FOR_REVOCATION' });
       }
       const revokeRes = await LedgerService.confirmPartnerReward(txId, 'REVOKED');
+      // Rollback punti (best-effort, non blocca la revoca)
+      try { await LedgerService.revokeRewardWithRollback(txId); } catch { /* ignora */ }
       if (!revokeRes.success) {
         return res.status(409).json({ ok: false, error: revokeRes.error || 'REVOKE_FAILED' });
       }

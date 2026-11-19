@@ -749,7 +749,6 @@ export class LedgerService {
       return { ok: false, error: err.message };
     }
   }
-
   static async requestPayout(params: {
     requestId: string;
     userId: number;
@@ -932,6 +931,17 @@ export class LedgerService {
       increment,
     ]);
     return res.rows[0]?.result;
+  }
+
+  static async revokeRewardWithRollback(eventId: string): Promise<{ ok: boolean; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(`SELECT core.revoke_reward_with_rollback($1) AS result`, [eventId]);
+      const r = res.rows[0]?.result;
+      return { ok: Boolean(r?.success), error: r?.error };
+    } catch (err: any) {
+      return { ok: false, error: err.message };
+    }
   }
 
   static async auditLedgerIntegrity(): Promise<any> {

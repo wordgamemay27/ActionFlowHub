@@ -1,0 +1,13 @@
+-- Migration 020 — Separazione privilegi DB (NON APPLICATA)
+-- Crea ruolo read-only per il processo webhook (solo SELECT su tabelle operative).
+-- Il processo webhook non puo' modificare saldi, crediti, compensi, config.
+-- DO $$ BEGIN
+--   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'webhook_readonly') THEN
+--     CREATE ROLE webhook_readonly LOGIN PASSWORD 'CHANGE_ME';
+--   END IF;
+-- END $$;
+-- GRANT CONNECT ON DATABASE current_database() TO webhook_readonly;
+-- GRANT USAGE ON SCHEMA core TO webhook_readonly;
+-- GRANT SELECT ON ALL TABLES IN SCHEMA core TO webhook_readonly;
+-- REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA core FROM webhook_readonly;
+SELECT 1; -- placeholder
