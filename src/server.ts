@@ -812,22 +812,30 @@ export function createExpressApp() {
     if (providedSignature && Number.isFinite(webhookTimestamp) && webhookTimestamp > 0) {
       const rawBody = (req as any).rawBody
         ? (req as any).rawBody.toString('utf8')
-        : JSON.stringify(req.body ?? {});
-      const message = `${webhookTimestamp}.${rawBody}`;
-      const expected = crypto.createHmac('sha256', webhookSecret).update(message).digest('hex');
-      try {
-        hmacValid =
-          providedSignature.length === expected.length &&
-          crypto.timingSafeEqual(Buffer.from(providedSignature, 'hex'), Buffer.from(expected, 'hex'));
-      } catch {
+        : null;
+      if (!rawBody) {
         hmacValid = false;
+      } else {
+        const message = `${webhookTimestamp}.${rawBody}`;
+        const expected = crypto.createHmac('sha256', webhookSecret).update(message).digest('hex');
+        try {
+          hmacValid =
+            providedSignature.length === expected.length &&
+            crypto.timingSafeEqual(Buffer.from(providedSignature, 'hex'), Buffer.from(expected, 'hex'));
+        } catch {
+          hmacValid = false;
+        }
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (Math.abs(nowSec - webhookTimestamp) > 300) hmacValid = false;
       }
-      const nowSec = Math.floor(Date.now() / 1000);
-      if (Math.abs(nowSec - webhookTimestamp) > 300) hmacValid = false;
     }
 
     // Firma legacy (solo secret) — transizione controllata
-    const legacyValid = !providedSignature && !!webhookSecret && safeTokenEquals(providedSecret, webhookSecret);
+    const legacyExpiry = process.env.WEBHOOK_LEGACY_EXPIRY
+      ? new Date(process.env.WEBHOOK_LEGACY_EXPIRY).getTime()
+      : Date.now() + 30 * 24 * 60 * 60 * 1000;
+    const legacyAllowed = Date.now() < legacyExpiry;
+    const legacyValid = legacyAllowed && !providedSignature && !!webhookSecret && safeTokenEquals(providedSecret, webhookSecret);
 
     if (!webhookSecret || (!hmacValid && !legacyValid)) {
       return res.status(401).json({ ok: false, error: 'WEBHOOK_AUTH_REQUIRED' });
@@ -1109,6 +1117,21 @@ export function createExpressApp() {
   app.post('/api/payout/request', financialLimiter, async (req: Request, res: Response) => {
     const authUser = requireTelegramUser(req, res);
     if (!authUser) return;
+
+    // Kill switch globale payout
+    if (process.env.PAYOUTS_DISABLED === 'true') {
+      return res.status(503).json({ ok: false, error: 'PAYOUTS_DISABLED_BY_KILL_SWITCH' });
+    }
+    if (dbPool) {
+      try {
+        const ks = await dbPool.query(`SELECT enabled FROM core.kill_switch WHERE key = 'PAYOUTS_DISABLED'`);
+        if (ks.rows[0]?.enabled === true) {
+          return res.status(503).json({ ok: false, error: 'PAYOUTS_DISABLED_BY_KILL_SWITCH' });
+        }
+      } catch {
+        // tabella non esiste → ignora
+      }
+    }
 
     if (!dbPool) {
       return res.status(503).json({
