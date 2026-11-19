@@ -55,6 +55,12 @@ export function buildAffiliateUrl(
   params: { clickId: string; partnerId?: string; subId?: string; sub2?: string }
 ): string {
   if (!baseUrl) return baseUrl;
+  try {
+    const u = new URL(baseUrl.trim());
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+  } catch {
+    return '';
+  }
   const sep = baseUrl.includes('?') ? '&' : '?';
   const query: string[] = [`click_id=${encodeURIComponent(params.clickId)}`];
   if (params.partnerId) query.push(`partner_id=${encodeURIComponent(params.partnerId)}`);
