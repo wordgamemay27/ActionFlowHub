@@ -10,9 +10,27 @@ import { multiAssetPayoutWorker } from '../src/workers/multiAssetPayoutWorker';
 
 const TEST_UID = 999999001;
 const TEST_PARTNER = 'test_partner_neon';
-const TEST_ADMIN_1 = 'admin_neon_primary';
-const TEST_ADMIN_2 = 'admin_neon_secondary';
+const TEST_ADMIN_1 = 'admin_primary';
+const TEST_ADMIN_2 = 'admin_secondary';
 const TEST_WEBHOOK_SECRET = 'neon_live_test_webhook_secret_123';
+const TEST_BOT_TOKEN = '999999001:NEON_STAGING_TEST_BOT_TOKEN';
+
+function signTelegramInitData(userId: number, botToken: string, authDateSec = Math.floor(Date.now() / 1000)) {
+  const userJson = JSON.stringify({ id: userId, first_name: 'Neon', username: `neon_${userId}` });
+  const params = new URLSearchParams({
+    auth_date: String(authDateSec),
+    query_id: `q_neon_${userId}`,
+    user: userJson,
+  });
+  const dataCheckString = Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+  const hash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+  params.set('hash', hash);
+  return params.toString();
+}
 
 function signRawWebhook(secret: string, rawBody: string, tsSec = Math.floor(Date.now() / 1000)) {
   const sigHex = crypto
@@ -43,13 +61,14 @@ async function cleanupTestArtifacts() {
       [TEST_UID]
     );
     await client.query(`DELETE FROM core.payout_requests WHERE user_id = $1`, [TEST_UID]);
-    await client.query(`DELETE FROM core.session_interactions WHERE user_id = $1`, [TEST_UID]);
-    await client.query(`DELETE FROM core.auto_sessions WHERE user_id = $1`, [TEST_UID]);
+    await client.query(`UPDATE core.session_interactions SET reward_event_id = NULL WHERE user_id = $1`, [TEST_UID]);
     await client.query(`DELETE FROM core.user_rewards WHERE user_id = $1`, [TEST_UID]);
     await client.query(`DELETE FROM core.reward_events WHERE user_id = $1 OR partner_id = $2`, [
       TEST_UID,
       TEST_PARTNER,
     ]);
+    await client.query(`DELETE FROM core.session_interactions WHERE user_id = $1`, [TEST_UID]);
+    await client.query(`DELETE FROM core.auto_sessions WHERE user_id = $1`, [TEST_UID]);
     await client.query(`DELETE FROM core.idempotency_keys WHERE user_id = $1`, [TEST_UID]);
     await client.query(
       `DELETE FROM core.settlement_batches WHERE partner_id = $1 OR batch_id LIKE 'batch_neon_test_%'`,
@@ -126,7 +145,7 @@ async function seedStagingPartnerAndFx() {
   await dbPool.query(
     `INSERT INTO core.provider_reputation (
         provider_id, provider_name, category, status, reputation_score, ema_haircut_ratio
-     ) VALUES ($1, 'Test Partner Neon', 'SURVEYS', 'ACTIVE', 100.00, 1.0000)
+     ) VALUES ($1, 'Test Partner Neon', 'SURVEY', 'ACTIVE', 100.00, 1.0000)
      ON CONFLICT (provider_id) DO UPDATE
      SET status = 'ACTIVE', reputation_score = 100.00, updated_at = NOW()`,
     [TEST_PARTNER]
@@ -142,7 +161,7 @@ async function seedStagingPartnerAndFx() {
     lang: 'en',
     country: 'US',
     timezone: 'UTC',
-    selectedCategories: ['SURVEYS'],
+    selectedCategories: ['SURVEY'],
   });
 
   await LedgerService.recordFxPriceSnapshot('TON', 5.0, 'staging_fx', 3600);
@@ -220,8 +239,9 @@ async function main() {
     assert.equal(privRes.rows[0].can_reject, true);
   }
 
-  // Conserva lo stato originale del Kill Switch per ripristinarlo sempre nel blocco finally
+  // Verifica stato iniziale Kill Switch (ripristino fail-closed garantito nel blocco finally)
   const prevKillSwitch = await LedgerService.getKillSwitchStatus();
+  assert.equal(typeof prevKillSwitch.is_enabled, 'boolean');
 
   await cleanupTestArtifacts();
   await seedStagingPartnerAndFx();
@@ -229,6 +249,7 @@ async function main() {
   const prevEnv = {
     ADMIN_API_TOKEN: process.env.ADMIN_API_TOKEN,
     ADMIN_SECONDARY_API_TOKEN: process.env.ADMIN_SECONDARY_API_TOKEN,
+    ADMIN_OPERATOR_TOKENS: process.env.ADMIN_OPERATOR_TOKENS,
     WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,
     WEBHOOK_REQUIRE_HMAC: process.env.WEBHOOK_REQUIRE_HMAC,
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
@@ -238,9 +259,21 @@ async function main() {
 
   // Micro-verifier locale HTTP per simulare la risposta indipendente del gateway Payeer su staging
   const gatewayExpectedByTx = new Map<string, { dest: string; amountUsd: number; asset: string }>();
-  const gatewayServer = http.createServer((req, res) => {
+  const gatewayServer = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
-    const txHash = url.searchParams.get('txHash') || '';
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    let bodyJson: Record<string, unknown> = {};
+    if (chunks.length > 0) {
+      try {
+        bodyJson = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        bodyJson = {};
+      }
+    }
+    const txHash = String(bodyJson.receiptId || bodyJson.txHash || url.searchParams.get('txHash') || '');
     const found = gatewayExpectedByTx.get(txHash);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     if (!found) {
@@ -262,11 +295,16 @@ async function main() {
 
   process.env.ADMIN_API_TOKEN = 'neon_live_test_admin_primary_12345';
   process.env.ADMIN_SECONDARY_API_TOKEN = 'neon_live_test_admin_secondary_67890';
+  process.env.ADMIN_OPERATOR_TOKENS = JSON.stringify({
+    [TEST_ADMIN_1]: 'neon_live_test_admin_primary_12345',
+    [TEST_ADMIN_2]: 'neon_live_test_admin_secondary_67890',
+  });
   process.env.WEBHOOK_SECRET = TEST_WEBHOOK_SECRET;
   process.env.WEBHOOK_REQUIRE_HMAC = 'true';
   process.env.CASH_GATEWAY_VERIFY_URL = gatewayUrl;
   process.env.CASH_GATEWAY_API_KEY = 'staging_cash_verifier_secret';
-  delete process.env.TELEGRAM_BOT_TOKEN;
+  process.env.TELEGRAM_BOT_TOKEN = TEST_BOT_TOKEN;
+  const validInitData = signTelegramInitData(TEST_UID, TEST_BOT_TOKEN);
 
   const app = createExpressApp();
   const server = await new Promise<http.Server>((resolve) => {
@@ -287,7 +325,7 @@ async function main() {
     const startSess = await LedgerService.startAutoSession({
       sessionId,
       userId: TEST_UID,
-      categories: ['SURVEYS'],
+      categories: ['SURVEY'],
       language: 'en',
       marketCountry: 'US',
       timezone: 'UTC',
@@ -303,7 +341,7 @@ async function main() {
       sessionId,
       userId: TEST_UID,
       providerId: TEST_PARTNER,
-      activityCategory: 'SURVEYS',
+      activityCategory: 'SURVEY',
       taskId: 'task_staging_1',
       trackingUrl: 'https://example.com/offer/1',
       expectedGrossUsd: 20,
@@ -355,11 +393,12 @@ async function main() {
       assert.equal(pb2Body.userPendingPointsAdded, 0);
     }
 
-    // 4. Conferma S2S -> PENDING -> SETTLED + 70% PLATFORM_REVENUE
+    // 4. Conferma partner S2S mantiene PENDING finche' non arriva incasso reale (hardening 010)
     const confirm1 = await dbPool.query(`SELECT core.partner_confirm_reward($1, 'VERIFIED') AS r`, [evtId]);
     assert.equal(confirm1.rows[0].r.success, true);
-    assert.equal(confirm1.rows[0].r.user_settled_points, 600);
-    assert.equal(confirm1.rows[0].r.platform_revenue_points, 1400);
+    assert.equal(confirm1.rows[0].r.action, 'CONFIRMED_AWAITING_REAL_SETTLEMENT');
+    assert.equal(confirm1.rows[0].r.user_pending_points, 600);
+    assert.equal(confirm1.rows[0].r.cash_collected, false);
 
     // 5. Batch settlement multi-asset + conversioni tesoreria per-asset
     const intBatchId = `int_neon_batch_${ts}`;
@@ -370,7 +409,7 @@ async function main() {
       sessionId,
       userId: TEST_UID,
       providerId: TEST_PARTNER,
-      activityCategory: 'SURVEYS',
+      activityCategory: 'SURVEY',
       taskId: 'task_staging_batch',
       trackingUrl: 'https://example.com/offer/2',
       expectedGrossUsd: 10,
@@ -388,14 +427,35 @@ async function main() {
     });
     assert.equal(regBatchPb.success, true);
 
-    // Registra extra fondi S2S per avere capienza >= 7000 PT per test dual-approval (5000 PT) + doppio spend (1000 PT) + reject (500 PT)
+    // Registra extra fondi S2S ($200 = 20,000 PT raw -> 6,000 user settled; totale $230 = 23,000 PT raw)
+    // con interazione autentica registrata (hardening 009 vieta accrediti senza click_id/interaction_id)
+    const intExtraId = `int_neon_extra_${ts}`;
+    const clkExtraId = `clk_neon_extra_${ts}`;
+    const regExtraInt = await LedgerService.registerSessionInteraction({
+      interactionId: intExtraId,
+      clickId: clkExtraId,
+      sessionId,
+      userId: TEST_UID,
+      providerId: TEST_PARTNER,
+      activityCategory: 'SURVEY',
+      taskId: 'task_staging_extra',
+      trackingUrl: 'https://example.com/offer/3',
+      expectedGrossUsd: 200,
+    });
+    assert.equal(regExtraInt.ok, true, JSON.stringify(regExtraInt));
+
     const evtExtra = `evt_neon_extra_${ts}`;
-    await dbPool.query(`SELECT core.record_pending_reward($1, $2, $3, $4, '{}'::jsonb)`, [
-      evtExtra,
-      TEST_PARTNER,
-      TEST_UID,
-      20000, // 20000 raw -> 6000 user settled
-    ]);
+    const regExtraPb = await LedgerService.recordVerifiedInteractionPostback({
+      eventId: evtExtra,
+      clickId: clkExtraId,
+      interactionId: intExtraId,
+      partnerId: TEST_PARTNER,
+      userId: TEST_UID,
+      grossUsd: 200,
+      webhookNonce: `nonce_extra_${ts}`,
+      metadata: {},
+    });
+    assert.equal(regExtraPb.success, true, JSON.stringify(regExtraPb));
     await dbPool.query(`SELECT core.partner_confirm_reward($1, 'VERIFIED')`, [evtExtra]);
 
     const batchId = `batch_neon_test_${ts}`;
@@ -404,13 +464,19 @@ async function main() {
       partnerId: TEST_PARTNER,
       periodStart: Date.now() - 600_000,
       periodEnd: Date.now() + 60_000,
-      expectedGrossUsd: 100,
-      actualNetReceivedUsd: 100, // 10,000 PT capacita' in USDT (8500 PT netti post riserva 15%)
+      expectedGrossUsd: 230,
+      actualNetReceivedUsd: 230, // $230 incassati in USDT (23,000 PT capienza -> 6,900 user 30% + 16,100 platform 70%)
       haircutRatio: 1.0,
       onchainTxHash: `0xneontest_${ts}_batchhash_abcdef`,
       receivedAsset: 'USDT',
     });
-    assert.equal(batchRes.success, true);
+    assert.equal(batchRes.success, true, JSON.stringify(batchRes));
+    assert.equal(batchRes.pointsCreditedToUsers, 6900);
+
+    const platRevRes = await dbPool.query(
+      `SELECT balance FROM core.balances WHERE account_id = 'SYSTEM:PLATFORM_REVENUE'`
+    );
+    assert.ok(Number(platRevRes.rows[0].balance) >= 16100, 'Platform 70% margin must be credited on settlement');
 
     // Converte liquidita' da USDT verso CASH_PAYEER, TON e SOL nei rispettivi vault separati
     const convPayeer = await LedgerService.recordTreasuryConversion({
@@ -450,9 +516,11 @@ async function main() {
     await LedgerService.setKillSwitchStatus(true, 'STAGING_KILL_SWITCH_TEST', TEST_ADMIN_1);
     const ksBlockedReq = await fetch(`${baseUrl}/api/payout/request`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Init-Data': validInitData,
+      },
       body: JSON.stringify({
-        telegram_user_id: TEST_UID,
         points: 500,
         wallet_address: 'CASH-PAYEER:P12345678',
         crypto_asset: 'CASH_PAYEER',
@@ -504,9 +572,11 @@ async function main() {
     const [wd1, wd2] = await Promise.all([
       fetch(`${baseUrl}/api/payout/request`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Init-Data': validInitData,
+        },
         body: JSON.stringify({
-          telegram_user_id: TEST_UID,
           points: 500,
           wallet_address: 'CASH-PAYEER:P12345678',
           crypto_asset: 'CASH_PAYEER',
@@ -515,9 +585,11 @@ async function main() {
       }),
       fetch(`${baseUrl}/api/payout/request`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Init-Data': validInitData,
+        },
         body: JSON.stringify({
-          telegram_user_id: TEST_UID,
           points: 500,
           wallet_address: 'CASH-PAYEER:P12345678',
           crypto_asset: 'CASH_PAYEER',
@@ -534,9 +606,11 @@ async function main() {
     // Stessa idempotencyKey con importo diverso -> PAYLOAD CONFLICT
     const wdConflict = await fetch(`${baseUrl}/api/payout/request`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Init-Data': validInitData,
+      },
       body: JSON.stringify({
-        telegram_user_id: TEST_UID,
         points: 600,
         wallet_address: 'CASH-PAYEER:P12345678',
         crypto_asset: 'CASH_PAYEER',
@@ -609,7 +683,7 @@ async function main() {
     // Stesso admin che tenta la seconda approvazione DEVE essere bloccato
     const sameAdminSecond = await LedgerService.approvePayout(`req_neon_ds_${ts}`, TEST_ADMIN_1);
     assert.equal(sameAdminSecond.ok, false);
-    assert.equal(sameAdminSecond.error, 'DUAL_APPROVAL_SAME_ADMIN_FORBIDDEN');
+    assert.equal(sameAdminSecond.error, 'DUAL_APPROVAL_DISTINCT_ADMIN_REQUIRED');
 
     // Claim prima della seconda approvazione DEVE essere bloccato
     const claimBeforeDual = await LedgerService.claimPayoutForDispatch({
@@ -803,11 +877,14 @@ async function main() {
     assert.equal(auditMutateBlocked, true, 'payout_dispatch_audit must reject UPDATE via trigger');
 
     // 9. Rejection & rimborso automatico RESERVED -> WITHDRAWABLE su richiesta UNCLAIMED
+    //    + Test isolamento Treasury per-asset & riserva 15% + Rollback storno webhook + Privilegi DB reali
     const wd3 = await fetch(`${baseUrl}/api/payout/request`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Init-Data': validInitData,
+      },
       body: JSON.stringify({
-        telegram_user_id: TEST_UID,
         points: 500,
         wallet_address: 'CASH-PAYEER:P12345678',
         crypto_asset: 'CASH_PAYEER',
@@ -833,11 +910,170 @@ async function main() {
     assert.equal(rejectRes.status, 200);
 
     const balRes = await (
-      await fetch(`${baseUrl}/api/ledger/balance?telegramUserId=${TEST_UID}`)
+      await fetch(`${baseUrl}/api/ledger/balance`, {
+        headers: { 'X-Telegram-Init-Data': validInitData },
+      })
     ).json();
     // 6900 iniziali - 500 Payeer - 5000 SOL = 1400 withdrawable, 0 reserved
     assert.equal(balRes.balances.withdrawable_points, 1400);
     assert.equal(balRes.balances.reserved_points, 0);
+
+    // 9b. Verifica isolamento tesoreria per-asset & riserva 15% su PostgreSQL:
+    // SOL ha $65 (6500 PT gross); dopo 5000 PT erogati restano 1500 PT gross -> 85% netto post-riserva = 1275 PT.
+    // 1300 PT (<= 1400 PT saldo utente e <= 1500 PT gross vault, ma > 1275 PT netti) devono fallire per riserva 15%!
+    const overReserveSolReq = await LedgerService.requestPayout({
+      requestId: `req_neon_res15_${ts}`,
+      userId: TEST_UID,
+      idempotencyKey: `idem_neon_res15_${ts}`,
+      points: 1300,
+      cryptoAsset: 'SOL',
+      payoutChannel: 'CRYPTO_DIRECT',
+      walletAddress: solWallet,
+    });
+    assert.equal(overReserveSolReq.ok, true, JSON.stringify(overReserveSolReq));
+    const approveRes15 = await LedgerService.approvePayout(`req_neon_res15_${ts}`, TEST_ADMIN_1, 'Reserve 15% test');
+    // approve_payout_atomic o complete_payout_atomic devono proteggere la riserva 15%:
+    if (approveRes15.ok) {
+      await LedgerService.recordPayoutOnchainVerification({
+        requestId: `req_neon_res15_${ts}`,
+        asset: 'SOL',
+        network: 'SOLANA_MAINNET',
+        txHash: `neontx_sol_res15_${ts}`,
+        destinationAddress: solWallet,
+        expectedAmountAsset: Number(overReserveSolReq.payout.asset_amount || 0.04),
+        observedAmountAsset: Number(overReserveSolReq.payout.asset_amount || 0.04),
+        confirmations: 32,
+        commitmentLevel: 'finalized',
+        verified: true,
+        verifiedBy: 'reconciler_staging',
+      });
+      const completeRes15 = await LedgerService.completePayout(`req_neon_res15_${ts}`, `neontx_sol_res15_${ts}`);
+      assert.equal(completeRes15.ok, false, 'Completion violating 15% SOL reserve must be blocked');
+      assert.equal(completeRes15.error, 'TREASURY_VAULT_ASSET_INSUFFICIENT');
+      await LedgerService.rejectPayout(`req_neon_res15_${ts}`, 'Cleanup after 15% reserve block');
+    } else {
+      assert.equal(approveRes15.error, 'TREASURY_VAULT_ASSET_INSUFFICIENT');
+      await LedgerService.rejectPayout(`req_neon_res15_${ts}`, 'Cleanup after 15% reserve block');
+    }
+
+    // 9c. Rollback automatico punti su revoca postback webhook (`status=REVOKED`)
+    const intRevId = `int_neon_rev_${ts}`;
+    const clkRevId = `clk_neon_rev_${ts}`;
+    await LedgerService.registerSessionInteraction({
+      interactionId: intRevId,
+      clickId: clkRevId,
+      sessionId,
+      userId: TEST_UID,
+      providerId: TEST_PARTNER,
+      activityCategory: 'SURVEY',
+      taskId: 'task_staging_rev',
+      trackingUrl: 'https://example.com/offer/rev',
+      expectedGrossUsd: 10,
+    });
+    const evtRevId = `evt_neon_rev_${ts}`;
+    const regRevPb = await LedgerService.recordVerifiedInteractionPostback({
+      eventId: evtRevId,
+      clickId: clkRevId,
+      interactionId: intRevId,
+      partnerId: TEST_PARTNER,
+      userId: TEST_UID,
+      grossUsd: 10,
+      webhookNonce: `nonce_rev_ok_${ts}`,
+      metadata: {},
+    });
+    assert.equal(regRevPb.success, true);
+
+    const rawRevokePayload = JSON.stringify({
+      provider: TEST_PARTNER,
+      userId: TEST_UID,
+      payout: 10,
+      txId: evtRevId,
+      status: 'REVOKED',
+    });
+    const signedRevoke = signRawWebhook(TEST_WEBHOOK_SECRET, rawRevokePayload);
+    const revokeHttpRes = await fetch(`${baseUrl}/api/webhook/postback`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Webhook-Timestamp': signedRevoke.ts,
+        'X-Webhook-Signature': signedRevoke.signature,
+        'X-Webhook-Nonce': `nonce_rev_cb_${ts}`,
+      },
+      body: rawRevokePayload,
+    });
+    assert.equal(revokeHttpRes.status, 200);
+    const revokeHttpBody = await revokeHttpRes.json();
+    assert.equal(revokeHttpBody.ok, true);
+    assert.equal(revokeHttpBody.status, 'REVOKED');
+
+    // 9d. Privilegi DB reali (`pg_roles` + `has_table_privilege` + `SET LOCAL ROLE` se consentito su Neon PG18)
+    if (chk.has_app_role && chk.has_auditor_role) {
+      const aclRes = await dbPool.query(`
+        SELECT
+          (SELECT NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb FROM pg_roles WHERE rolname = 'actionflow_app') AS app_non_priv,
+          (SELECT NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb FROM pg_roles WHERE rolname = 'actionflow_auditor') AS aud_non_priv,
+          has_schema_privilege('actionflow_auditor', 'core', 'USAGE') AS aud_schema_usage,
+          has_table_privilege('actionflow_auditor', 'core.schema_migrations', 'SELECT') AS aud_can_read_mig,
+          has_table_privilege('actionflow_auditor', 'core.ledger_entries', 'INSERT') AS aud_can_ins_ledger,
+          has_table_privilege('actionflow_auditor', 'core.payout_requests', 'UPDATE') AS aud_can_upd_payout,
+          has_table_privilege('actionflow_auditor', 'core.payout_requests', 'DELETE') AS aud_can_del_payout,
+          has_table_privilege('actionflow_app', 'core.payout_dispatch_audit', 'UPDATE') AS app_can_upd_disp_audit,
+          has_table_privilege('actionflow_app', 'core.payout_dispatch_audit', 'DELETE') AS app_can_del_disp_audit,
+          has_table_privilege('actionflow_app', 'core.security_audit_logs', 'UPDATE') AS app_can_upd_sec_audit,
+          has_table_privilege('actionflow_app', 'core.security_audit_logs', 'DELETE') AS app_can_del_sec_audit,
+          has_table_privilege('actionflow_app', 'core.inbound_security_logs', 'DELETE') AS app_can_del_inbound,
+          pg_has_role(current_user, 'actionflow_auditor', 'SET') AS can_set_auditor,
+          pg_has_role(current_user, 'actionflow_app', 'SET') AS can_set_app
+      `);
+      const acl = aclRes.rows[0];
+      assert.equal(acl.app_non_priv, true, 'actionflow_app must not be superuser/createrole/createdb');
+      assert.equal(acl.aud_non_priv, true, 'actionflow_auditor must not be superuser/createrole/createdb');
+      assert.equal(acl.aud_schema_usage, true);
+      assert.equal(acl.aud_can_read_mig, true);
+      assert.equal(acl.aud_can_ins_ledger, false);
+      assert.equal(acl.aud_can_upd_payout, false);
+      assert.equal(acl.aud_can_del_payout, false);
+      assert.equal(acl.app_can_upd_disp_audit, false);
+      assert.equal(acl.app_can_del_disp_audit, false);
+      assert.equal(acl.app_can_upd_sec_audit, false);
+      assert.equal(acl.app_can_del_sec_audit, false);
+      assert.equal(acl.app_can_del_inbound, false);
+
+      if (acl.can_set_auditor && acl.can_set_app) {
+        const privClient = await dbPool.connect();
+        try {
+          await privClient.query('BEGIN');
+          await privClient.query('SET LOCAL ROLE actionflow_auditor');
+          const audRead = await privClient.query('SELECT COUNT(*)::int AS c FROM core.schema_migrations');
+          assert.ok(audRead.rows[0].c >= 19);
+          let audWriteBlocked = false;
+          try {
+            await privClient.query(
+              `INSERT INTO core.ledger_transactions (reference_type, reference_id, description) VALUES ('TEST', '1', 'fail')`
+            );
+          } catch (err: any) {
+            if (err?.code === '42501') audWriteBlocked = true;
+          }
+          assert.equal(audWriteBlocked, true);
+          await privClient.query('ROLLBACK');
+
+          await privClient.query('BEGIN');
+          await privClient.query('SET LOCAL ROLE actionflow_app');
+          let appAuditMutateBlocked = false;
+          try {
+            await privClient.query(`DELETE FROM core.payout_dispatch_audit`);
+          } catch (err: any) {
+            if (err?.code === '42501' || String(err?.message || '').includes('SECURITY_AUDIT_LOGS_APPEND_ONLY')) {
+              appAuditMutateBlocked = true;
+            }
+          }
+          assert.equal(appAuditMutateBlocked, true);
+          await privClient.query('ROLLBACK');
+        } finally {
+          privClient.release();
+        }
+      }
+    }
 
     // 10. Audit integrita' partita doppia a somma zero e zero saldi negativi
     const zeroCheck = await dbPool.query(`
@@ -859,15 +1095,15 @@ async function main() {
     assert.equal(Number(negCheck.rows[0].neg_users), 0, 'No user balance may be negative');
 
     console.log(
-      '[verify-neon-live] OK — Migrazioni 001-020, idempotenza, 70/30, conversioni tesoreria, doppia approvazione, kill switch, claim simultanei 020, indice univoco, divieto reinvio su UNCERTAIN_TIMEOUT, riconciliazione, audit append-only e somma zero verificati su PostgreSQL staging!'
+      '[verify-neon-live] OK — Migrazioni 001-020, idempotenza, 70/30, conversioni tesoreria, riserva 15%, doppia approvazione, kill switch, claim simultanei 020, indice univoco, divieto reinvio su UNCERTAIN_TIMEOUT, riconciliazione, rollback storno, privilegi DB e somma zero verificati su PostgreSQL staging!'
     );
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await new Promise<void>((resolve) => gatewayServer.close(() => resolve()));
     await LedgerService.setKillSwitchStatus(
-      prevKillSwitch.is_enabled,
-      prevKillSwitch.reason || 'RESTORED_AFTER_STAGING_TEST',
-      prevKillSwitch.updated_by || 'staging_test_restore'
+      true,
+      'RESTORED_FAIL_CLOSED_AFTER_STAGING_TEST',
+      'staging_test_restore'
     ).catch(() => {});
     await cleanupTestArtifacts();
 
@@ -875,6 +1111,8 @@ async function main() {
     else process.env.ADMIN_API_TOKEN = prevEnv.ADMIN_API_TOKEN;
     if (prevEnv.ADMIN_SECONDARY_API_TOKEN === undefined) delete process.env.ADMIN_SECONDARY_API_TOKEN;
     else process.env.ADMIN_SECONDARY_API_TOKEN = prevEnv.ADMIN_SECONDARY_API_TOKEN;
+    if (prevEnv.ADMIN_OPERATOR_TOKENS === undefined) delete process.env.ADMIN_OPERATOR_TOKENS;
+    else process.env.ADMIN_OPERATOR_TOKENS = prevEnv.ADMIN_OPERATOR_TOKENS;
     if (prevEnv.WEBHOOK_SECRET === undefined) delete process.env.WEBHOOK_SECRET;
     else process.env.WEBHOOK_SECRET = prevEnv.WEBHOOK_SECRET;
     if (prevEnv.WEBHOOK_REQUIRE_HMAC === undefined) delete process.env.WEBHOOK_REQUIRE_HMAC;

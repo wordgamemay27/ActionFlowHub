@@ -703,6 +703,8 @@ $$ LANGUAGE plpgsql;
 -- 6. PAYOUT ATOMICI CON KILL SWITCH, LIMITI FINANZIARI, DOPPIA APPROVAZIONE
 --    E COPERTURA PER-ASSET SENZA CONTAMINAZIONE CROSS-ASSET (M1-M5)
 -- ----------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS core.request_payout_atomic(TEXT, BIGINT, BIGINT, TEXT, TEXT, TEXT, TEXT, INTEGER);
+
 CREATE OR REPLACE FUNCTION core.request_payout_atomic(
     p_request_id TEXT,
     p_user_id BIGINT,
