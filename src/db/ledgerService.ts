@@ -14,6 +14,7 @@ import { applyDbCountryProfileRows, type EconomicRegionGroup } from '../services
 import type { ProviderReputationSnapshot } from '../lib/providerPriority';
 
 dotenv.config();
+dotenv.config({ path: '.env.local' });
 
 const connectionString = process.env.DATABASE_URL;
 let pool: Pool | null = null;
