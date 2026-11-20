@@ -22,6 +22,7 @@ import { buildGlassPlaceholderDataUri } from '../lib/glassPlaceholder';
 import { openTrackedLink } from '../lib/affiliate';
 import { useTranslation } from '../lib/i18n';
 import { localizeProviderItem } from '../lib/providerLocalization';
+import { isSafeExternalHttpsUrl } from '../utils/navigation';
 
 export type GeoRegion = 'GLOBAL' | 'IT_EU' | 'US_UK_CA';
 export type AirdropSubKind = 'WALLET_EXCHANGE' | 'TELEGRAM_TON_AIRDROP' | 'WEB3_ESCROW_AIRDROP';
@@ -266,11 +267,12 @@ export const ProviderExecutionModal: React.FC<ProviderExecutionModalProps> = ({
                   )}
                   <span>{copiedMail ? t.ui.copiedBtn : t.ui.copyBtn}</span>
                 </button>
-                {provider.compartmentPortalUrl && (
+                {provider.compartmentPortalUrl && isSafeExternalHttpsUrl(provider.compartmentPortalUrl) && (
                   <a
                     href={provider.compartmentPortalUrl}
                     target="_blank"
                     rel="noopener noreferrer"
+                    referrerPolicy="no-referrer"
                     className="px-2.5 py-1 rounded-lg bg-sky-500/20 border border-sky-400/40 text-[11px] font-bold text-sky-200"
                   >
                     {t.ui.openBtn}

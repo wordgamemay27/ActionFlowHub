@@ -31,6 +31,8 @@
 | `019_treasury_sql_and_session_rollback_hardening.sql` | Kilo `019` | Registro `core.schema_migrations`, trigger append-only log, ruolo `actionflow_app`, rollback punti su `revoke_auto_session`, lock deadlock-safe in `execute_batch_settlement` & `release_settled_to_withdrawable_for_user`, wrapper `core.release_settled`, cross-check completo proof in `complete_payout_atomic` | Pronta in repo |
 | `020_payout_dispatch_claims_and_double_spend_guard.sql` | Kilo `020` (`090f479`) | Protezione anti-double-spend persistente su PostgreSQL: `core.payout_dispatch_attempts` (indice parziale univoco anti-concorrenza), state machine (`CLAIMED -> BROADCASTING -> CONFIRMED_ONCHAIN \| UNCERTAIN_TIMEOUT -> COMPLETED`), `core.claim_payout_for_dispatch`, `core.update_payout_dispatch_state` (blocco reinvio su esito incerto), `core.get_uncertain_payout_dispatches` per riconciliazione RPC, `core.payout_dispatch_audit` append-only | Pronta in repo |
 
+> **Nota di allineamento repository (branch `kilo/cold-rune-nck`, commit `4fb654a`)**: nel workspace locale sono presenti le **19 migrazioni SQL `001`–`020`** (con `003` gap intenzionale). Eventuali migrazioni successive `021`–`022` menzionate nel riferimento `4fb654a` **non sono presenti nei file locali** e richiedono sincronizzazione diretta da GitHub (`git fetch origin kilo/cold-rune-nck`) prima del deploy staging.
+
 ---
 
 ## 2. Configurazione Variabili d'Ambiente (`.env.example`)
@@ -42,6 +44,7 @@ Nessun segreto reale deve essere committato nel repository. Le variabili operati
 * **Sicurezza Inbound & Webhook S2S**: `WEBHOOK_SECRET`, `WEBHOOK_REQUIRE_HMAC="true"`, `WEBHOOK_LEGACY_SECRET_SUNSET_AT`, `EXTRA_ALLOWED_PARTNER_DOMAINS`.
 * **Custodia & Verifica Payout (`MANUAL_EXTERNAL` di default)**:
   * `PAYOUT_EXECUTION_MODE="MANUAL_EXTERNAL"` e `ENABLE_AUTO_PAYOUT_DISPATCH="false"` (nessuna chiave privata server-side attiva).
+  * `PAYOUT_KILL_SWITCH = TRUE` sul database come default fail-closed post-migrazione.
   * `ONCHAIN_TX_VERIFY_REQUIRED="true"` (in `NODE_ENV=production` è sempre obbligatorio e non disattivabile).
   * `CASH_MANUAL_RECEIPT_ALLOW="false"` (in produzione richiede `CASH_GATEWAY_VERIFY_URL` + `CASH_GATEWAY_API_KEY`, salvo autorizzazione manuale esplicita).
 * **RPC & Token Contract Address verificabili**:
@@ -52,16 +55,25 @@ Nessun segreto reale deve essere committato nel repository. Le variabili operati
 
 ---
 
-## 3. Procedura di Backup, Applicazione Migrazioni & Rollback
+## 3. Runner Migrazioni, Logging Strutturato, Backup & Rollback
 
-### 3.1 Pre-Checklist prima di applicare migrazioni su Neon
+### 3.1 Runner Migrazioni con Verifica Integrità SHA-256 (`bootstrapDatabaseSchema` & `npm run migrations:verify`)
+* Ordine numerico deterministico (`001` -> `020`), rilevazione di gap imprevisti o prefissi duplicati.
+* Calcolo automatico `checksum_sha256` per ogni file SQL: impedisce l'avvio se una migrazione già applicata viene alterata (`MIGRATION_CHECKSUM_MISMATCH`) e supporta il backfill sicuro delle righe legacy preesistenti senza checksum.
+* Verifica di sicurezza offline: eseguire `npm run migrations:verify`.
+
+### 3.2 Logging Strutturato & Readiness (`/api/health`)
+* `src/lib/logger.ts` emette log JSON strutturati con redazione automatica di password in connection string `postgresql://`, token `ADMIN_API_TOKEN` / `Bearer`, segreti `WEBHOOK_SECRET` e mnemonic.
+* `GET /api/health` espone in chiaro (senza segreti) `dbConnected`, `payoutExecutionMode`, `autoDispatchEnabled`, `webhookRequireHmac`, `killSwitchDefaultFailClosed`, `migrationsCount`, `migrationsValid`.
+
+### 3.3 Pre-Checklist prima di applicare migrazioni su Neon
 1. **Attivare Kill Switch payout** prima della manutenzione (`POST /api/admin/kill-switch` con `enabled: true`) per evitare transiti payout concorrenti.
-2. **Creare snapshot/branch Neon pre-migrazione** (Neon Console → Branches → *Create branch from `main`* nominato `pre-mig-019-YYYYMMDD`) **e** dump logico di sicurezza con connessione unpooled:
+2. **Creare snapshot/branch Neon pre-migrazione** (Neon Console → Branches → *Create branch from `main`* nominato `pre-mig-020-YYYYMMDD`) **e** dump logico di sicurezza con connessione unpooled:
    ```bash
    pg_dump "$DATABASE_URL_UNPOOLED" \
      --schema=core \
      --format=custom \
-     --file="backup_core_pre_019_$(date -u +%Y%m%dT%H%M%SZ).dump"
+     --file="backup_core_pre_020_$(date -u +%Y%m%dT%H%M%SZ).dump"
    ```
 3. **Verificare integrità contabile pre-migrazione**:
    ```sql
@@ -69,8 +81,13 @@ Nessun segreto reale deve essere committato nel repository. Le variabili operati
    SELECT * FROM core.v_treasury_vault_status;
    ```
 
-### 3.2 Applicazione controllata su staging / produzione
-Eseguire le migrazioni mancanti in ordine stretto usando `DATABASE_URL_UNPOOLED` dentro transazione atomica (`-v ON_ERROR_STOP=1`):
+### 3.4 Applicazione controllata su staging
+```bash
+npm run migrations:verify
+npm run staging:prepare
+npm run test:neon
+```
+Oppure in ordine manuale con connessione unpooled (`DATABASE_URL_UNPOOLED`) dentro transazione atomica (`-v ON_ERROR_STOP=1`):
 ```bash
 for f in migrations/011_*.sql migrations/012_*.sql migrations/013_*.sql migrations/014_*.sql migrations/015_*.sql migrations/016_*.sql migrations/017_*.sql migrations/018_*.sql migrations/019_*.sql migrations/020_*.sql; do
   echo "Applying $f ..."
@@ -83,12 +100,12 @@ SELECT migration_id, source_reference, applied_at FROM core.schema_migrations OR
 SELECT core.audit_ledger_integrity();
 ```
 
-### 3.3 Procedura di Rollback
+### 3.5 Procedura di Rollback
 * **Rollback applicativo**: ripristino del tag Git precedente (`git checkout <tag_precedente> && npm run build`) e riavvio processo Express (`npm start`).
 * **Rollback database (preferito — Neon Point-in-Time / Branch Restore)**:
   1. Mantenere `PAYOUT_KILL_SWITCH = TRUE`.
-  2. Promuovere il branch Neon `pre-mig-019-*` (o eseguire Point-in-Time Recovery al timestamp immediatamente precedente alla manutenzione).
-  3. In alternativa da dump locale: ripristino su nuovo branch pulito con `pg_restore --clean --if-exists --dbname="$TARGET_UNPOOLED_URL" backup_core_pre_019_*.dump` (mai sovrascrivere alla cieca senza verifica `audit_ledger_integrity()`).
+  2. Promuovere il branch Neon `pre-mig-020-*` (o eseguire Point-in-Time Recovery al timestamp immediatamente precedente alla manutenzione).
+  3. In alternativa da dump locale: ripristino su nuovo branch pulito con `pg_restore --clean --if-exists --dbname="$TARGET_UNPOOLED_URL" backup_core_pre_020_*.dump` (mai sovrascrivere alla cieca senza verifica `audit_ledger_integrity()`).
 
 ---
 
@@ -96,8 +113,10 @@ SELECT core.audit_ledger_integrity();
 
 | Verifica | Comando / Origine | Stato | Note |
 |---|---|---|---|
-| Suite offline `npm test` (6/6 script: `ledger`, `e2e`, `entry`, `brands`, `hardening`, `economics`) | `DATABASE_URL="" npm test` | **PASS** | Eseguito localmente dopo l'allineamento |
+| Suite offline `npm test` (6/6 script: `ledger`, `e2e`, `entry`, `brands`, `hardening`, `economics`) | `DATABASE_URL="" npm test` | **PASS** | Eseguito localmente dopo l'allineamento e le correzioni di sicurezza |
+| Verifica deterministica manifest & checksum SHA-256 migrazioni `001`–`020` | `npm run migrations:verify` | **PASS** | Ordine numerico, bilanciamento `BEGIN/COMMIT` e tamper detection verificati |
 | Build di produzione (`vite build`) | `npm run build` | **PASS** | Bundle compilato senza errori |
 | Type-check TypeScript (`tsc --noEmit`) | `npm run lint` | **PASS** | Zero errori di tipo |
-| Test live PostgreSQL/Neon (`test:neon`, concorrenza SQL multi-istanza, applicazione `011`–`020`) | Richiede `DATABASE_URL` live | **NON ESEGUITO** | Ambiente privo di DB live e migrazioni produzione bloccate per sicurezza |
-| Verifica live RPC blockchain (`TON`, `SOL`, `PI`, `USDT`, `USDC`) e gateway cash reali (`Payeer`, `Airtm`, `Volet`) | Richiede rete/credenziali esterne | **NON ESEGUITO** | Coperti offline con stub fetch + state machine mock (`verify-hardening.ts`); mainnet/testnet live richiedono staging autorizzato |
+| Test live PostgreSQL/Neon (`test:neon`, concorrenza SQL multi-istanza, applicazione `011`–`020`) | Richiede `DATABASE_URL` staging live | **NON ESEGUITO** | Ambiente privo di DB staging configurato nel processo e migrazioni produzione bloccate |
+| Verifica live RPC blockchain (`TON`, `SOL`, `PI`, `USDT`, `USDC`) e gateway cash reali (`Payeer`, `Airtm`, `Volet`) | Richiede rete/credenziali esterne | **NON ESEGUITO** | Coperti offline con mock fetch + state machine audit; testnet/mainnet live richiedono staging autorizzato |
+

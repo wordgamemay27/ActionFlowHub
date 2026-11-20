@@ -1,8 +1,9 @@
-import fs from 'node:fs';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { Pool } from 'pg';
 import dotenv from 'dotenv';
+import { logger } from '../lib/logger';
 import {
   normalizeCountryCode,
   resolveCountryEconomicProfile,
@@ -64,6 +65,138 @@ export interface FxRateSnapshot {
   expires_at: string;
 }
 
+const KNOWN_ALLOWED_MIGRATION_GAPS = new Set<number>([3]);
+
+export interface MigrationManifestItem {
+  filename: string;
+  prefixNum: number;
+  migrationId: string;
+  sha256: string;
+  hasTransactionWrapper: boolean;
+  bytes: number;
+}
+
+export interface MigrationManifestResult {
+  ok: boolean;
+  files: MigrationManifestItem[];
+  errors: string[];
+}
+
+export function computeMigrationSha256(rawSql: string): string {
+  const normalized = rawSql.replace(/\r\n/g, '\n');
+  return crypto.createHash('sha256').update(normalized, 'utf8').digest('hex');
+}
+
+export function inspectMigrationFiles(
+  migrationsDir = path.join(process.cwd(), 'migrations')
+): MigrationManifestResult {
+  const errors: string[] = [];
+  if (!fs.existsSync(migrationsDir)) {
+    return { ok: true, files: [], errors: [] };
+  }
+
+  const rawEntries = fs
+    .readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql') && /^\d+_/.test(f));
+
+  const parsed: MigrationManifestItem[] = rawEntries
+    .map((filename) => {
+      const m = filename.match(/^(\d+)_/);
+      const prefixNum = m ? Number(m[1]) : Number.NaN;
+      const migrationId = m ? m[1].padStart(3, '0') : '000';
+      const fullPath = path.join(migrationsDir, filename);
+      const rawSql = fs.readFileSync(fullPath, 'utf8');
+      const trimmed = rawSql.trim();
+      const sha256 = computeMigrationSha256(rawSql);
+      const hasTransactionWrapper =
+        /^\s*BEGIN\s*;/im.test(rawSql) && /\bCOMMIT\s*;\s*(?:--[^\n]*)?$/im.test(trimmed);
+
+      if (!trimmed) {
+        errors.push(`EMPTY_MIGRATION_FILE:${filename}`);
+      }
+      const beginCount = (rawSql.match(/^\s*BEGIN\s*;/gim) || []).length;
+      const commitCount = (rawSql.match(/^\s*COMMIT\s*;/gim) || []).length;
+      if (beginCount !== commitCount) {
+        errors.push(`UNBALANCED_TRANSACTION_WRAPPER:${filename}:BEGIN=${beginCount}:COMMIT=${commitCount}`);
+      }
+
+      return {
+        filename,
+        prefixNum,
+        migrationId,
+        sha256,
+        hasTransactionWrapper,
+        bytes: Buffer.byteLength(rawSql, 'utf8'),
+      };
+    })
+    .sort((a, b) => a.prefixNum - b.prefixNum || a.filename.localeCompare(b.filename));
+
+  const seenPrefixes = new Set<number>();
+  for (let i = 0; i < parsed.length; i++) {
+    const cur = parsed[i];
+    if (!Number.isInteger(cur.prefixNum) || cur.prefixNum <= 0) {
+      errors.push(`INVALID_MIGRATION_PREFIX:${cur.filename}`);
+      continue;
+    }
+    if (seenPrefixes.has(cur.prefixNum)) {
+      errors.push(`DUPLICATE_MIGRATION_PREFIX:${cur.migrationId}:${cur.filename}`);
+    }
+    seenPrefixes.add(cur.prefixNum);
+
+    if (i > 0) {
+      const prev = parsed[i - 1];
+      for (let missing = prev.prefixNum + 1; missing < cur.prefixNum; missing++) {
+        if (!KNOWN_ALLOWED_MIGRATION_GAPS.has(missing)) {
+          errors.push(`MIGRATION_SEQUENCE_GAP:${String(missing).padStart(3, '0')}`);
+        }
+      }
+    }
+  }
+
+  return {
+    ok: errors.length === 0,
+    files: parsed,
+    errors,
+  };
+}
+
+export function verifyAppliedMigrationChecksums(
+  appliedRows: Array<{ filename: string; checksum_sha256?: string | null }>,
+  manifestFiles: MigrationManifestItem[]
+): {
+  toApply: MigrationManifestItem[];
+  skipped: MigrationManifestItem[];
+  toBackfillChecksum: MigrationManifestItem[];
+} {
+  const appliedMap = new Map<string, string | null>();
+  for (const row of appliedRows) {
+    appliedMap.set(String(row.filename), row.checksum_sha256 ? String(row.checksum_sha256) : null);
+  }
+
+  const toApply: MigrationManifestItem[] = [];
+  const skipped: MigrationManifestItem[] = [];
+  const toBackfillChecksum: MigrationManifestItem[] = [];
+
+  for (const file of manifestFiles) {
+    if (appliedMap.has(file.filename)) {
+      const storedHash = appliedMap.get(file.filename);
+      if (storedHash && storedHash !== file.sha256) {
+        throw new Error(
+          `MIGRATION_CHECKSUM_MISMATCH:${file.filename}:expected=${storedHash}:actual=${file.sha256}`
+        );
+      }
+      if (!storedHash) {
+        toBackfillChecksum.push(file);
+      }
+      skipped.push(file);
+    } else {
+      toApply.push(file);
+    }
+  }
+
+  return { toApply, skipped, toBackfillChecksum };
+}
+
 export async function bootstrapDatabaseSchema(): Promise<{
   applied: string[];
   skipped: string[];
@@ -73,10 +206,10 @@ export async function bootstrapDatabaseSchema(): Promise<{
   const migrationsDir = path.join(process.cwd(), 'migrations');
   if (!fs.existsSync(migrationsDir)) return { applied: [], skipped: [] };
 
-  const files = fs
-    .readdirSync(migrationsDir)
-    .filter((f) => f.endsWith('.sql') && /^\d+_/.test(f))
-    .sort();
+  const manifest = inspectMigrationFiles(migrationsDir);
+  if (!manifest.ok) {
+    throw new Error(`MIGRATION_MANIFEST_INVALID: ${manifest.errors.join('; ')}`);
+  }
 
   const client = await pool.connect();
   const applied: string[] = [];
@@ -87,38 +220,60 @@ export async function bootstrapDatabaseSchema(): Promise<{
     await client.query(`
       CREATE TABLE IF NOT EXISTS core.schema_migrations (
         filename TEXT PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        content_hash TEXT
+        migration_id TEXT,
+        checksum_sha256 TEXT,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await client.query(`ALTER TABLE core.schema_migrations ADD COLUMN IF NOT EXISTS migration_id TEXT`);
+    await client.query(`ALTER TABLE core.schema_migrations ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT`);
 
-    await client.query(`
-      ALTER TABLE core.schema_migrations ADD COLUMN IF NOT EXISTS content_hash TEXT
-    `);
+    const appliedRes = await client.query(
+      `SELECT filename, checksum_sha256 FROM core.schema_migrations`
+    );
+    const plan = verifyAppliedMigrationChecksums(appliedRes.rows, manifest.files);
 
-    const appliedRes = await client.query(`SELECT filename, content_hash FROM core.schema_migrations`);
-    const alreadyApplied = new Map<string, string | null>(appliedRes.rows.map((r) => [String(r.filename), r.content_hash ? String(r.content_hash) : null]));
+    for (const file of plan.toBackfillChecksum) {
+      await client.query(
+        `UPDATE core.schema_migrations
+            SET checksum_sha256 = $2,
+                migration_id = COALESCE(migration_id, $3)
+          WHERE filename = $1`,
+        [file.filename, file.sha256, file.migrationId]
+      );
+    }
+    for (const file of plan.skipped) {
+      skipped.push(file.filename);
+    }
 
-    for (const file of files) {
-      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-      const hash = crypto.createHash('sha256').update(sql).digest('hex');
-
-      if (alreadyApplied.has(file)) {
-        const storedHash = alreadyApplied.get(file);
-        if (storedHash && storedHash !== hash) {
-          console.warn(`[DB MIGRATION] WARNING: ${file} was modified after application (hash mismatch). Skipping.`);
+    for (const file of plan.toApply) {
+      const sql = fs.readFileSync(path.join(migrationsDir, file.filename), 'utf8');
+      try {
+        if (file.hasTransactionWrapper) {
+          await client.query(sql);
+        } else {
+          await client.query('BEGIN');
+          await client.query(sql);
+          await client.query('COMMIT');
         }
-        skipped.push(file);
-        continue;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
       }
 
-      await client.query(sql);
       await client.query(
-        `INSERT INTO core.schema_migrations (filename, content_hash) VALUES ($1, $2) ON CONFLICT (filename) DO UPDATE SET content_hash = $2`,
-        [file, hash]
+        `INSERT INTO core.schema_migrations (filename, migration_id, checksum_sha256)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (filename) DO UPDATE
+           SET checksum_sha256 = EXCLUDED.checksum_sha256,
+               migration_id = COALESCE(core.schema_migrations.migration_id, EXCLUDED.migration_id)`,
+        [file.filename, file.migrationId, file.sha256]
       );
-      applied.push(file);
-      console.info(`[DB MIGRATION] Applicata con successo: ${file}`);
+      applied.push(file.filename);
+      logger.info('DB_MIGRATION', `Migrazione applicata con successo: ${file.filename}`, {
+        migrationId: file.migrationId,
+        sha256: file.sha256,
+      });
     }
   } finally {
     client.release();
@@ -761,6 +916,7 @@ export class LedgerService {
       return { ok: false, error: err.message };
     }
   }
+
   static async requestPayout(params: {
     requestId: string;
     userId: number;
@@ -842,19 +998,37 @@ export class LedgerService {
       whereClause = `WHERE status = $${params.length} OR payout_status = $${params.length}`;
     }
     params.push(safeLimit);
-    const res = await pool.query(
-      `SELECT request_id, user_id, idempotency_key, points, amount_usd::float8 AS amount_usd,
-              amount_ton::float8 AS amount_ton, COALESCE(asset_amount, amount_ton)::float8 AS asset_amount,
-              fx_usd_per_asset::float8 AS fx_usd_per_asset, fx_source, fx_quoted_at,
-              crypto_asset, payout_channel, wallet_address, status, payout_status, tx_hash,
-              approved_by, approved_at, completed_at AS paid_at, rejected_at, note, created_at
-         FROM core.payout_requests
-        ${whereClause}
-        ORDER BY created_at DESC
-        LIMIT $${params.length}`,
-      params
-    );
-    return res.rows;
+    try {
+      const res = await pool.query(
+        `SELECT request_id, user_id, idempotency_key, points, amount_usd::float8 AS amount_usd,
+                amount_ton::float8 AS amount_ton, COALESCE(asset_amount, amount_ton)::float8 AS asset_amount,
+                fx_usd_per_asset::float8 AS fx_usd_per_asset, fx_source, fx_quoted_at,
+                crypto_asset, payout_channel, wallet_address, status, payout_status,
+                COALESCE(dispatch_state, 'UNCLAIMED') AS dispatch_state,
+                active_dispatch_attempt_id, dispatch_uncertainty_reason,
+                tx_hash, approved_by, approved_at, completed_at AS paid_at, rejected_at, note, created_at
+           FROM core.payout_requests
+          ${whereClause}
+          ORDER BY created_at DESC
+          LIMIT $${params.length}`,
+        params
+      );
+      return res.rows;
+    } catch {
+      const res = await pool.query(
+        `SELECT request_id, user_id, idempotency_key, points, amount_usd::float8 AS amount_usd,
+                amount_ton::float8 AS amount_ton, COALESCE(asset_amount, amount_ton)::float8 AS asset_amount,
+                fx_usd_per_asset::float8 AS fx_usd_per_asset, fx_source, fx_quoted_at,
+                crypto_asset, payout_channel, wallet_address, status, payout_status, tx_hash,
+                approved_by, approved_at, completed_at AS paid_at, rejected_at, note, created_at
+           FROM core.payout_requests
+          ${whereClause}
+          ORDER BY created_at DESC
+          LIMIT $${params.length}`,
+        params
+      );
+      return res.rows;
+    }
   }
 
   static async getUserLedgerFeed(userId: number, limit = 40): Promise<{
@@ -943,17 +1117,6 @@ export class LedgerService {
       increment,
     ]);
     return res.rows[0]?.result;
-  }
-
-  static async revokeRewardWithRollback(eventId: string): Promise<{ ok: boolean; error?: string }> {
-    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
-    try {
-      const res = await pool.query(`SELECT core.revoke_reward_with_rollback($1) AS result`, [eventId]);
-      const r = res.rows[0]?.result;
-      return { ok: Boolean(r?.success), error: r?.error };
-    } catch (err: any) {
-      return { ok: false, error: err.message };
-    }
   }
 
   static async auditLedgerIntegrity(): Promise<any> {

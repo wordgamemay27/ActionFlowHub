@@ -8,8 +8,9 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { LedgerService, dbPool, bootstrapDatabaseSchema } from './db/ledgerService';
+import { LedgerService, dbPool, bootstrapDatabaseSchema, inspectMigrationFiles } from './db/ledgerService';
 import { SettlementService } from './db/settlementService';
+import { logger } from './lib/logger';
 import providerAdminRouter from './routes/providerAdmin';
 import { WALLET_CONFIG } from './config/wallets';
 import { workers } from './workers';
@@ -343,17 +344,18 @@ export function createExpressApp() {
   function authenticateAdminRequest(req: Request):
     | { ok: true; actor: string; method: 'TOKEN' | 'TELEGRAM' }
     | { ok: false; status: number; error: string } {
-    const explicitActor = String(req.header('x-admin-id') || '').trim().slice(0, 64);
+    const explicitActor = String(req.header('x-admin-id') || '').trim().toLowerCase().slice(0, 64);
     const token = (req.header('x-admin-token') || '').trim();
     const operatorEntries = parseAdminOperatorTokenMap();
 
     if (token) {
       for (const entry of operatorEntries) {
         if (safeTokenEquals(token, entry.token)) {
-          if (explicitActor && explicitActor !== entry.actor) {
+          const canonicalActor = entry.actor.trim().toLowerCase();
+          if (explicitActor && explicitActor !== canonicalActor) {
             return { ok: false, status: 403, error: 'ADMIN_ACTOR_MISMATCH' };
           }
-          return { ok: true, actor: entry.actor, method: 'TOKEN' };
+          return { ok: true, actor: canonicalActor, method: 'TOKEN' };
         }
       }
       return { ok: false, status: 401, error: 'ADMIN_AUTH_REQUIRED' };
@@ -365,7 +367,7 @@ export function createExpressApp() {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
-      const tgActor = `tg_admin_${tgCheck.userData.id}`;
+      const tgActor = `tg_admin_${tgCheck.userData.id}`.toLowerCase();
       if (!admins.includes(String(tgCheck.userData.id))) {
         return { ok: false, status: 403, error: 'FORBIDDEN' };
       }
@@ -431,12 +433,23 @@ export function createExpressApp() {
   // ============================================================================
   app.get('/api/health', (_req: Request, res: Response) => {
     const workerMetrics = workers.tonPayout.getMetrics();
+    const multiStatus = workers.multiAssetPayout.getStatus();
+    const migrations = inspectMigrationFiles();
+    const legacyPolicy = checkLegacyWebhookTransition();
     res.json({
       status: 'OK',
       service: 'ActionFlow Hub Backend',
       dbConnected: Boolean(dbPool),
       sessionMode: 'UNIFIED_AUTO',
       payoutMode: workerMetrics.mode,
+      payoutExecutionMode: multiStatus.payoutExecutionMode,
+      autoDispatchEnabled:
+        process.env.PAYOUT_EXECUTION_MODE === 'EXTERNAL_SIGNER_HSM' &&
+        process.env.ENABLE_AUTO_PAYOUT_DISPATCH === 'true',
+      webhookRequireHmac: legacyPolicy.hmacStrictlyRequired,
+      killSwitchDefaultFailClosed: true,
+      migrationsCount: migrations.files.length,
+      migrationsValid: migrations.ok,
       uptimeSeconds: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
     });
@@ -2000,7 +2013,12 @@ export async function startServer() {
 
   await new Promise<void>((resolve, reject) => {
     const server = app.listen(PORT, HOST, () => {
-      console.log(`ActionFlow Hub Server listening on http://${HOST}:${PORT}`);
+      logger.info('SERVER', `ActionFlow Hub Server listening on http://${HOST}:${PORT}`, {
+        port: PORT,
+        host: HOST,
+        dbConnected: Boolean(dbPool),
+        payoutExecutionMode: workers.multiAssetPayout.getStatus().payoutExecutionMode,
+      });
       resolve();
     });
     server.on('error', (err) => {
@@ -2014,7 +2032,7 @@ const isDirectEntry =
   (process.argv[1].endsWith('/src/server.ts') || process.argv[1].endsWith('/src/server.js'));
 if (isDirectEntry) {
   startServer().catch((err) => {
-    console.error('[SERVER STARTUP ABORTED] Migrazione o avvio fallito:', err);
+    logger.error('SERVER_STARTUP_ABORTED', 'Migrazione o avvio fallito', { error: err });
     process.exit(1);
   });
 }

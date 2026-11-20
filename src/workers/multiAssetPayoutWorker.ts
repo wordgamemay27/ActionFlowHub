@@ -64,6 +64,8 @@ export interface MultiAssetDispatchResult {
   asset: string;
   attemptId?: string;
   dispatchState?: string;
+  requiresReconciliation?: boolean;
+  reconciliationStatus?: 'RICHIEDE RICONCILIAZIONE';
   txHash?: string;
   explorerUrl?: string;
   error?: string;
@@ -287,6 +289,8 @@ export class MultiAssetPayoutWorker {
         asset,
         attemptId: tonRes.attemptId,
         dispatchState: tonRes.dispatchState,
+        requiresReconciliation: tonRes.requiresReconciliation,
+        reconciliationStatus: tonRes.reconciliationStatus,
         txHash: tonRes.txHash,
         explorerUrl: tonRes.explorerUrl,
         error: tonRes.error,
@@ -300,6 +304,8 @@ export class MultiAssetPayoutWorker {
         ok: false,
         requestId,
         asset,
+        requiresReconciliation: true,
+        reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
         error: verifGuard.reason || 'PAYOUT_ASSET_INDEPENDENT_VERIFICATION_UNAVAILABLE',
       };
     }
@@ -383,12 +389,20 @@ export class MultiAssetPayoutWorker {
       attemptId,
     });
     if (!claim.ok) {
+      const uncertainClaim =
+        claim.dispatch_state === 'UNCERTAIN_TIMEOUT' ||
+        claim.dispatch_state === 'BROADCASTING' ||
+        claim.dispatch_state === 'CLAIMED' ||
+        claim.error === 'PAYOUT_RESEND_BLOCKED_UNCERTAIN_OR_CONFIRMED_OUTCOME';
       return {
         ok: false,
         requestId,
         asset,
         attemptId: claim.active_attempt_id,
         dispatchState: claim.dispatch_state,
+        ...(uncertainClaim
+          ? { requiresReconciliation: true, reconciliationStatus: 'RICHIEDE RICONCILIAZIONE' as const }
+          : {}),
         txHash: claim.tx_hash,
         error: claim.error || 'PAYOUT_CLAIM_REJECTED',
       };
@@ -518,6 +532,8 @@ export class MultiAssetPayoutWorker {
             asset,
             attemptId: effectiveAttemptId,
             dispatchState: 'UNCERTAIN_TIMEOUT',
+            requiresReconciliation: true,
+            reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
             error: data?.error || `PI_PAYOUT_HTTP_${res.status}`,
           };
         }
@@ -569,6 +585,8 @@ export class MultiAssetPayoutWorker {
             asset,
             attemptId: effectiveAttemptId,
             dispatchState: 'UNCERTAIN_TIMEOUT',
+            requiresReconciliation: true,
+            reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
             error: data?.error || `STABLECOIN_GATEWAY_HTTP_${res.status}`,
           };
         }
@@ -622,6 +640,8 @@ export class MultiAssetPayoutWorker {
             asset,
             attemptId: effectiveAttemptId,
             dispatchState: 'UNCERTAIN_TIMEOUT',
+            requiresReconciliation: true,
+            reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
             error: data?.error || `CASH_GATEWAY_HTTP_${res.status}`,
           };
         }
@@ -643,6 +663,8 @@ export class MultiAssetPayoutWorker {
           asset,
           attemptId: effectiveAttemptId,
           dispatchState: 'UNCERTAIN_TIMEOUT',
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           error: 'MISSING_TX_HASH_AFTER_BROADCAST',
         };
       }
@@ -681,6 +703,8 @@ export class MultiAssetPayoutWorker {
           asset,
           attemptId: effectiveAttemptId,
           dispatchState: 'UNCERTAIN_TIMEOUT',
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           txHash: capturedTxHash,
           error: independentCheck.reason || 'PAYOUT_INDEPENDENT_VERIFICATION_FAILED',
         };
@@ -774,6 +798,9 @@ export class MultiAssetPayoutWorker {
         asset,
         attemptId: effectiveAttemptId,
         dispatchState: broadcastEntered ? 'UNCERTAIN_TIMEOUT' : 'FAILED_SAFE_RETRYABLE',
+        ...(broadcastEntered
+          ? { requiresReconciliation: true, reconciliationStatus: 'RICHIEDE RICONCILIAZIONE' as const }
+          : {}),
         txHash: capturedTxHash || undefined,
         error: err?.message || 'MULTI_ASSET_DISPATCH_ERROR',
       };
@@ -813,6 +840,8 @@ export class MultiAssetPayoutWorker {
       asset: 'TON',
       attemptId: r.attemptId,
       dispatchState: r.dispatchState,
+      requiresReconciliation: r.requiresReconciliation,
+      reconciliationStatus: r.reconciliationStatus,
       txHash: r.txHash,
       error: r.error,
     }));
@@ -835,6 +864,8 @@ export class MultiAssetPayoutWorker {
           asset,
           attemptId,
           dispatchState: String(row.dispatch_state || 'UNCERTAIN_TIMEOUT'),
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           error: 'NO_TX_HASH_FOR_RECONCILIATION_RESEND_BLOCKED',
         });
         continue;
@@ -855,6 +886,8 @@ export class MultiAssetPayoutWorker {
           asset,
           attemptId,
           dispatchState: String(row.dispatch_state || 'UNCERTAIN_TIMEOUT'),
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           txHash,
           error: check.reason || 'RECONCILIATION_VERIFICATION_FAILED',
         });

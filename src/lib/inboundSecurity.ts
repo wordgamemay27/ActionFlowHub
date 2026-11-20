@@ -326,8 +326,8 @@ export function checkLegacyWebhookTransition(nowMs = Date.now()): {
   const legacyExpired = sunsetAtMs !== null && nowMs >= sunsetAtMs;
   const hmacStrictlyRequired =
     legacyExpired ||
-    process.env.WEBHOOK_REQUIRE_HMAC === 'true' ||
-    (process.env.NODE_ENV === 'production' && process.env.WEBHOOK_REQUIRE_HMAC !== 'false');
+    process.env.NODE_ENV === 'production' ||
+    process.env.WEBHOOK_REQUIRE_HMAC !== 'false';
 
   return {
     hmacStrictlyRequired,

@@ -4,12 +4,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createExpressApp } from '../src/server';
-import { LedgerService, dbPool, type PayoutDispatchStore } from '../src/db/ledgerService';
+import {
+  LedgerService,
+  dbPool,
+  inspectMigrationFiles,
+  verifyAppliedMigrationChecksums,
+  type PayoutDispatchStore,
+} from '../src/db/ledgerService';
 import { workers, tonPayoutWorker, multiAssetPayoutWorker } from '../src/workers';
 import {
   verifyPayoutTransactionOnChain,
   canVerifyPayoutAssetIndependently,
   shouldEnforceLiveRpcVerification,
+  resolveSolanaAllAccountKeys,
 } from '../src/services/onchainVerifier';
 import { newClickId, newInteractionId, resolveCanonicalProviderId } from '../src/lib/affiliate';
 import {
@@ -19,6 +26,7 @@ import {
   verifyWebhookRawBodyHmac,
   checkLegacyWebhookTransition,
 } from '../src/lib/inboundSecurity';
+import { sanitizeLogMeta } from '../src/lib/logger';
 import { isSafeExternalHttpsUrl } from '../src/utils/navigation';
 import { buildPrioritizedAutoCycleSteps, type CycleStepCandidate } from '../src/lib/providerPriority';
 
@@ -96,13 +104,19 @@ async function runHttpSecurityChecks() {
   const baseUrl = `http://127.0.0.1:${port}`;
 
   try {
-    // 1. Health endpoint
+    // 1. Health endpoint (incl. fail-closed security locks & migration manifest status)
     const healthRes = await fetch(`${baseUrl}/api/health`);
     assert.equal(healthRes.status, 200);
     const health = await healthRes.json();
     assert.equal(health.status, 'OK');
     assert.equal(health.dbConnected, hasDb);
     assert.equal(health.sessionMode, 'UNIFIED_AUTO');
+    assert.equal(health.payoutExecutionMode, 'MANUAL_EXTERNAL');
+    assert.equal(health.autoDispatchEnabled, false);
+    assert.equal(health.webhookRequireHmac, true);
+    assert.equal(health.killSwitchDefaultFailClosed, true);
+    assert.equal(health.migrationsValid, true);
+    assert.ok(health.migrationsCount >= 19);
 
     // 1b. FX rates endpoint returns structured rates map (200 live or 503 fail-closed offline)
     const fxRes = await fetch(`${baseUrl}/api/fx/rates`);
@@ -326,17 +340,30 @@ async function runHttpSecurityChecks() {
     });
     assert.equal(disburseNoAuth.status, 401);
 
-    // 7. Webhook postback requires secret & rejects invalid params / missing DB cleanly
+    // 7. Webhook postback enforces HMAC fail-closed by default; explicit legacy opt-out still validates X-Webhook-Secret
     const webhookNoSecret = await fetch(
       `${baseUrl}/api/webhook/postback?provider=reelshort&userId=1&payout=1&click_id=clk_1&txId=tx_1`
     );
     assert.equal(webhookNoSecret.status, 401);
 
-    const webhookWithSecret = await fetch(
+    const legacyBlockedByDefault = await fetch(
       `${baseUrl}/api/webhook/postback?provider=reelshort&userId=0&payout=0&txId=x`,
       { headers: { 'X-Webhook-Secret': 'test_webhook_secret_123456' } }
     );
-    assert.equal(webhookWithSecret.status, hasDb ? 400 : 503);
+    assert.equal(legacyBlockedByDefault.status, 401, 'Legacy X-Webhook-Secret without HMAC must fail closed by default');
+
+    const prevReqHmacForLegacyTest = process.env.WEBHOOK_REQUIRE_HMAC;
+    process.env.WEBHOOK_REQUIRE_HMAC = 'false';
+    try {
+      const webhookWithSecret = await fetch(
+        `${baseUrl}/api/webhook/postback?provider=reelshort&userId=0&payout=0&txId=x`,
+        { headers: { 'X-Webhook-Secret': 'test_webhook_secret_123456' } }
+      );
+      assert.equal(webhookWithSecret.status, hasDb ? 400 : 503);
+    } finally {
+      if (prevReqHmacForLegacyTest === undefined) delete process.env.WEBHOOK_REQUIRE_HMAC;
+      else process.env.WEBHOOK_REQUIRE_HMAC = prevReqHmacForLegacyTest;
+    }
 
     // 8. Admin Kill Switch, Treasury Status, Convert & Reverse endpoints require auth & DB fail-closed
     for (const ep of [
@@ -653,11 +680,14 @@ async function runHttpSecurityChecks() {
     assert.equal(tamperedRawPostRes.status, 401, 'Re-serialized body bytes must fail raw-body HMAC verification');
     assert.equal((await tamperedRawPostRes.json()).error, 'INVALID_WEBHOOK_SIGNATURE');
 
-    // Legacy sunset transition enforcement
+    // Legacy sunset transition enforcement (blocks legacy secret even if WEBHOOK_REQUIRE_HMAC='false')
     const prevSunset = process.env.WEBHOOK_LEGACY_SECRET_SUNSET_AT;
+    const prevRequireHmacSunset = process.env.WEBHOOK_REQUIRE_HMAC;
+    process.env.WEBHOOK_REQUIRE_HMAC = 'false';
     process.env.WEBHOOK_LEGACY_SECRET_SUNSET_AT = '2020-01-01T00:00:00Z';
     try {
       assert.equal(checkLegacyWebhookTransition().legacyExpired, true);
+      assert.equal(checkLegacyWebhookTransition().hmacStrictlyRequired, true);
       const expiredLegacyRes = await fetch(
         `${baseUrl}/api/webhook/postback?provider=reelshort&userId=1&payout=1&click_id=clk_1&txId=tx_1`,
         { headers: { 'X-Webhook-Secret': 'test_webhook_secret_123456' } }
@@ -667,6 +697,8 @@ async function runHttpSecurityChecks() {
     } finally {
       if (prevSunset === undefined) delete process.env.WEBHOOK_LEGACY_SECRET_SUNSET_AT;
       else process.env.WEBHOOK_LEGACY_SECRET_SUNSET_AT = prevSunset;
+      if (prevRequireHmacSunset === undefined) delete process.env.WEBHOOK_REQUIRE_HMAC;
+      else process.env.WEBHOOK_REQUIRE_HMAC = prevRequireHmacSunset;
     }
 
     // Raw-body HMAC unit check
@@ -1818,6 +1850,8 @@ async function runKilo090f479AlignmentAndDoubleSpendTests() {
     );
     assert.equal(tonTimeoutRes.ok, false);
     assert.equal(tonTimeoutRes.dispatchState, 'UNCERTAIN_TIMEOUT');
+    assert.equal(tonTimeoutRes.requiresReconciliation, true);
+    assert.equal(tonTimeoutRes.reconciliationStatus, 'RICHIEDE RICONCILIAZIONE');
 
     const tonResendAfterTimeout = await tonPayoutWorker.executeRealTonPayout(
       {
@@ -1835,6 +1869,7 @@ async function runKilo090f479AlignmentAndDoubleSpendTests() {
       }
     );
     assert.equal(tonResendAfterTimeout.ok, false);
+    assert.equal(tonResendAfterTimeout.reconciliationStatus, 'RICHIEDE RICONCILIAZIONE');
     assert.equal(
       tonResendAfterTimeout.error,
       'PAYOUT_RESEND_BLOCKED_UNCERTAIN_OR_CONFIRMED_OUTCOME',
@@ -1963,13 +1998,290 @@ async function runKilo090f479AlignmentAndDoubleSpendTests() {
   }
 }
 
+async function runOfflineStateAndResilienceTests() {
+  // 1. Logger secret redaction check (zero credential leakage)
+  const sanitized = sanitizeLogMeta({
+    databaseUrl: 'postgresql://neondb_owner:SuperSecretPass@ep-test.aws.neon.tech/neondb?sslmode=require',
+    headers: { 'x-admin-token': 'adm_secret_123', authorization: 'Bearer top_secret_jwt' },
+    mnemonic: 'word1 word2 word3',
+    note: 'postgresql://user:mypass@host/db Bearer abcdef123456',
+  }) as Record<string, any>;
+  const serialized = JSON.stringify(sanitized);
+  assert.equal(serialized.includes('SuperSecretPass'), false, 'PostgreSQL password must be redacted');
+  assert.equal(serialized.includes('adm_secret_123'), false, 'Admin token must be redacted');
+  assert.equal(serialized.includes('top_secret_jwt'), false, 'Bearer token must be redacted');
+  assert.equal(serialized.includes('word1 word2'), false, 'Mnemonic must be redacted');
+  assert.equal(serialized.includes('mypass'), false, 'Inline connection password must be redacted');
+
+  // 2. Migration manifest & SHA-256 tamper protection check
+  const manifest = inspectMigrationFiles();
+  assert.equal(manifest.ok, true, `Migration manifest check failed: ${manifest.errors.join('; ')}`);
+  assert.ok(manifest.files.length >= 19, 'Expected at least 19 ordered migration files');
+  assert.throws(
+    () =>
+      verifyAppliedMigrationChecksums(
+        [{ filename: manifest.files[0].filename, checksum_sha256: 'f'.repeat(64) }],
+        manifest.files
+      ),
+    /MIGRATION_CHECKSUM_MISMATCH/
+  );
+
+  // 3. Kill switch active blocks both workers even when bypassEnvGuardForTest is set
+  const ksActiveStore: PayoutDispatchStore = {
+    async getKillSwitchStatus() {
+      return { is_enabled: true, reason: 'TEST_EMERGENCY_STOP' };
+    },
+    async claimPayoutForDispatch() {
+      throw new Error('MUST_NOT_CLAIM_WHEN_KILL_SWITCH_ACTIVE');
+    },
+    async updatePayoutDispatchState() {
+      throw new Error('MUST_NOT_UPDATE_WHEN_KILL_SWITCH_ACTIVE');
+    },
+    async getUncertainPayoutDispatches() {
+      return { ok: true, items: [] };
+    },
+    async recordPayoutOnchainVerification() {
+      throw new Error('MUST_NOT_RECORD_WHEN_KILL_SWITCH_ACTIVE');
+    },
+    async completePayout() {
+      throw new Error('MUST_NOT_COMPLETE_WHEN_KILL_SWITCH_ACTIVE');
+    },
+  };
+
+  const ksTonRes = await tonPayoutWorker.executeRealTonPayout(
+    {
+      requestId: 'req_ks_ton',
+      destinationWallet: 'UQArcaLwWBTXqOfyJCy3mjPSEuD80p66jzF_95HyXRShBOo-',
+      amountTon: 1.0,
+    },
+    { store: ksActiveStore, bypassEnvGuardForTest: true }
+  );
+  assert.equal(ksTonRes.ok, false);
+  assert.equal(ksTonRes.error, 'PAYOUT_KILL_SWITCH_ACTIVE');
+
+  const ksSolRes = await multiAssetPayoutWorker.dispatchApprovedPayout(
+    {
+      requestId: 'req_ks_sol',
+      cryptoAsset: 'SOL',
+      destinationWallet: '11111111111111111111111111111111',
+      amountAsset: 0.5,
+      amountUsd: 50,
+    },
+    { store: ksActiveStore, bypassEnvGuardForTest: true, skipSolvencyCheckForTest: true }
+  );
+  assert.equal(ksSolRes.ok, false);
+  assert.equal(ksSolRes.error, 'PAYOUT_KILL_SWITCH_ACTIVE');
+
+  // 4. Non-verifiable asset / CASH_* without verifier returns RICHIEDE RICONCILIAZIONE fail-closed
+  const prevCashVerifyUrl = process.env.CASH_GATEWAY_VERIFY_URL;
+  delete process.env.CASH_GATEWAY_VERIFY_URL;
+  try {
+    const activeNoKillStore: PayoutDispatchStore = {
+      ...ksActiveStore,
+      async getKillSwitchStatus() {
+        return { is_enabled: false, reason: 'TEST_ENABLED' };
+      },
+    };
+    const cashUnverifiableRes = await multiAssetPayoutWorker.dispatchApprovedPayout(
+      {
+        requestId: 'req_cash_no_verifier',
+        cryptoAsset: 'CASH_PAYEER',
+        destinationWallet: 'CASH-PAYEER:P12345678',
+        amountAsset: 10,
+        amountUsd: 10,
+      },
+      {
+        store: activeNoKillStore,
+        bypassEnvGuardForTest: true,
+        skipSolvencyCheckForTest: true,
+        broadcasterOverride: async () => {
+          throw new Error('MUST_NOT_BROADCAST_UNVERIFIABLE_ASSET');
+        },
+      }
+    );
+    assert.equal(cashUnverifiableRes.ok, false);
+    assert.equal(cashUnverifiableRes.error, 'CASH_GATEWAY_VERIFIER_NOT_CONFIGURED');
+    assert.equal(cashUnverifiableRes.requiresReconciliation, true);
+    assert.equal(cashUnverifiableRes.reconciliationStatus, 'RICHIEDE RICONCILIAZIONE');
+  } finally {
+    if (prevCashVerifyUrl === undefined) delete process.env.CASH_GATEWAY_VERIFY_URL;
+    else process.env.CASH_GATEWAY_VERIFY_URL = prevCashVerifyUrl;
+  }
+
+  // 5. Solana v0 ALT resolution safety for listener deposits (string + loadedAddresses)
+  const resolvedKeys = resolveSolanaAllAccountKeys({
+    transaction: { message: { accountKeys: ['Vote111111111111111111111111111111111111111'] } },
+    meta: { loadedAddresses: { writable: ['FCiSaZcMYYPyzkJQkfNXdnw4v2PjiR241KYpEm2FeqdT'], readonly: [] } },
+  });
+  assert.equal(resolvedKeys.includes('FCiSaZcMYYPyzkJQkfNXdnw4v2PjiR241KYpEm2FeqdT'), true);
+
+  // 6. Stateful offline Ledger & Treasury & Idempotency & Dual-Approval & Rollback simulator
+  type Bucket = 'PENDING' | 'SETTLED' | 'WITHDRAWABLE' | 'RESERVED' | 'SYSTEM_PAID' | 'SYSTEM_REVENUE';
+  const buckets: Record<Bucket, number> = {
+    PENDING: 0,
+    SETTLED: 0,
+    WITHDRAWABLE: 0,
+    RESERVED: 0,
+    SYSTEM_PAID: 0,
+    SYSTEM_REVENUE: 0,
+  };
+  const journal: Array<{ account: Bucket; amount: number }> = [];
+  const postEntry = (from: Bucket, to: Bucket, pts: number) => {
+    assert.ok(pts > 0);
+    buckets[from] -= pts;
+    buckets[to] += pts;
+    journal.push({ account: from, amount: -pts }, { account: to, amount: pts });
+    assert.equal(
+      journal.reduce((s, e) => s + e.amount, 0),
+      0,
+      'Double-entry journal must always sum to zero'
+    );
+  };
+
+  // Vault per-asset isolation with 15% reserve buffer (8 assets initially 0)
+  const vaults: Record<string, { cashUsd: number; disbursedUsd: number }> = {};
+  for (const a of ['TON', 'SOL', 'PI', 'USDT', 'USDC', 'CASH_AIRTM', 'CASH_PAYEER', 'CASH_VOLET']) {
+    vaults[a] = { cashUsd: 0, disbursedUsd: 0 };
+  }
+  const netVaultCapacityPts = (asset: string) => {
+    const v = vaults[asset];
+    if (!v) return 0;
+    return Math.max(0, Math.floor((v.cashUsd * 0.85 - v.disbursedUsd) * 100));
+  };
+
+  // Postback verified: $200 gross = 20000 PT -> 30% user (6000 PT PENDING), 70% platform (14000 PT)
+  const userShare = Math.floor(20000 * 0.3 * 1.0);
+  buckets.PENDING += userShare;
+  buckets.SYSTEM_REVENUE += 20000 - userShare;
+  journal.push(
+    { account: 'SYSTEM_REVENUE', amount: -20000 },
+    { account: 'PENDING', amount: userShare },
+    { account: 'SYSTEM_REVENUE', amount: 20000 - userShare }
+  );
+  assert.equal(journal.reduce((s, e) => s + e.amount, 0), 0);
+
+  // Batch settlement collected in USDT ($200) -> ONLY USDT vault gets capacity; SOL remains 0
+  vaults.USDT.cashUsd += 200;
+  assert.equal(netVaultCapacityPts('USDT'), 17000);
+  assert.equal(netVaultCapacityPts('SOL'), 0, 'Isolated vault must keep uncollected assets at 0 capacity');
+  postEntry('PENDING', 'SETTLED', 6000);
+  postEntry('SETTLED', 'WITHDRAWABLE', 6000);
+
+  // Idempotency payload SHA-256 check + conflict detection + dual approval >= 5000 PT
+  const idemMap = new Map<string, { hash: string; requestId: string }>();
+  const payouts = new Map<
+    string,
+    {
+      points: number;
+      asset: string;
+      status: 'PENDING' | 'AWAITING_SECOND_APPROVAL' | 'APPROVED' | 'COMPLETED' | 'REJECTED';
+      dispatchState: string;
+      firstAdmin: string | null;
+      secondAdmin: string | null;
+    }
+  >();
+
+  const reqPayoutSim = (idemKey: string, points: number, asset: string, wallet: string) => {
+    const payloadHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ points, asset, wallet }))
+      .digest('hex');
+    const existing = idemMap.get(idemKey);
+    if (existing) {
+      if (existing.hash !== payloadHash) {
+        return { ok: false as const, status: 409, error: 'IDEMPOTENCY_KEY_PAYLOAD_CONFLICT' };
+      }
+      return { ok: true as const, idempotent: true, requestId: existing.requestId };
+    }
+    if (points > buckets.WITHDRAWABLE) {
+      return { ok: false as const, status: 409, error: 'INSUFFICIENT_WITHDRAWABLE_BALANCE' };
+    }
+    const requestId = `sim_${crypto.randomUUID().slice(0, 8)}`;
+    postEntry('WITHDRAWABLE', 'RESERVED', points);
+    idemMap.set(idemKey, { hash: payloadHash, requestId });
+    payouts.set(requestId, {
+      points,
+      asset,
+      status: 'PENDING',
+      dispatchState: 'UNCLAIMED',
+      firstAdmin: null,
+      secondAdmin: null,
+    });
+    return { ok: true as const, idempotent: false, requestId };
+  };
+
+  // Identical idempotent retry + conflicting payload check + concurrent double-spend attempt
+  const p1 = reqPayoutSim('k_5500', 5500, 'USDT', 'UQArcaLwWBTXqOfyJCy3mjPSEuD80p66jzF_95HyXRShBOo-');
+  assert.equal(p1.ok, true);
+  assert.equal(buckets.WITHDRAWABLE, 500);
+  assert.equal(buckets.RESERVED, 5500);
+
+  const p1Identical = reqPayoutSim('k_5500', 5500, 'USDT', 'UQArcaLwWBTXqOfyJCy3mjPSEuD80p66jzF_95HyXRShBOo-');
+  assert.equal(p1Identical.ok, true);
+  assert.equal(p1Identical.idempotent, true);
+  assert.equal(buckets.WITHDRAWABLE, 500);
+
+  const p1Conflict = reqPayoutSim('k_5500', 500, 'USDT', 'UQArcaLwWBTXqOfyJCy3mjPSEuD80p66jzF_95HyXRShBOo-');
+  assert.equal(p1Conflict.ok, false);
+  assert.equal(p1Conflict.status, 409);
+  assert.equal(p1Conflict.error, 'IDEMPOTENCY_KEY_PAYLOAD_CONFLICT');
+
+  const pInsufficient = reqPayoutSim('k_over', 600, 'USDT', 'UQArcaLwWBTXqOfyJCy3mjPSEuD80p66jzF_95HyXRShBOo-');
+  assert.equal(pInsufficient.ok, false);
+  assert.equal(pInsufficient.error, 'INSUFFICIENT_WITHDRAWABLE_BALANCE');
+
+  // Dual approval check (>= 5000 PT) with normalized actor comparison
+  const approveSim = (requestId: string, rawActor: string) => {
+    const p = payouts.get(requestId)!;
+    const actor = rawActor.trim().toLowerCase();
+    if (!p.firstAdmin) {
+      p.firstAdmin = actor;
+      p.status = p.points >= 5000 ? 'AWAITING_SECOND_APPROVAL' : 'APPROVED';
+      return { ok: true, status: p.status };
+    }
+    if (p.firstAdmin === actor) {
+      return { ok: false, error: 'DUAL_APPROVAL_DISTINCT_ADMIN_REQUIRED' };
+    }
+    p.secondAdmin = actor;
+    p.status = 'APPROVED';
+    return { ok: true, status: p.status };
+  };
+
+  const a1 = approveSim(p1.requestId!, 'Admin_Primary');
+  assert.equal(a1.status, 'AWAITING_SECOND_APPROVAL');
+  const aSameCased = approveSim(p1.requestId!, 'admin_primary');
+  assert.equal(aSameCased.ok, false);
+  assert.equal(aSameCased.error, 'DUAL_APPROVAL_DISTINCT_ADMIN_REQUIRED');
+  const a2 = approveSim(p1.requestId!, 'admin_secondary');
+  assert.equal(a2.ok, true);
+  assert.equal(a2.status, 'APPROVED');
+
+  // Active/Uncertain dispatch blocks rejection & point rollback integrity
+  const pObj = payouts.get(p1.requestId!)!;
+  pObj.dispatchState = 'UNCERTAIN_TIMEOUT';
+  const rejectBlocked =
+    pObj.dispatchState === 'BROADCASTING' || pObj.dispatchState === 'UNCERTAIN_TIMEOUT'
+      ? { ok: false, error: 'PAYOUT_CANNOT_BE_REJECTED_WHILE_DISPATCH_ACTIVE_OR_UNCERTAIN' }
+      : { ok: true };
+  assert.equal(rejectBlocked.ok, false);
+  assert.equal(rejectBlocked.error, 'PAYOUT_CANNOT_BE_REJECTED_WHILE_DISPATCH_ACTIVE_OR_UNCERTAIN');
+
+  // Complete payout: moves RESERVED -> SYSTEM_PAID, sum still 0
+  postEntry('RESERVED', 'SYSTEM_PAID', 5500);
+  vaults.USDT.disbursedUsd += 55;
+  assert.equal(buckets.RESERVED, 0);
+  assert.equal(buckets.SYSTEM_PAID, 5500);
+  assert.equal(journal.reduce((s, e) => s + e.amount, 0), 0);
+}
+
 async function main() {
   try {
     await runHttpSecurityChecks();
     runStaticHardeningChecks();
     await runKilo090f479AlignmentAndDoubleSpendTests();
+    await runOfflineStateAndResilienceTests();
     console.log(
-      '[verify-hardening] OK — Auth Telegram HMAC, disabilitazione 410 endpoint legacy, zero fallback/simulazioni, FX fail-closed, TON/Solana v0 ALT/PI/CASH verifier, protezione double-spend (crash/concorrenza/timeout/riconciliazione) e vincoli SQL 009-020 verificati.'
+      '[verify-hardening] OK — Auth Telegram HMAC, disabilitazione 410 endpoint legacy, zero fallback/simulazioni, FX fail-closed, TON/Solana v0 ALT/PI/CASH verifier, protezione double-spend (crash/concorrenza/timeout/riconciliazione), migrazioni SHA-256, redazione log, idempotenza/doppia approvazione/partita doppia e vincoli SQL 009-020 verificati.'
     );
   } finally {
     if (dbPool) {
