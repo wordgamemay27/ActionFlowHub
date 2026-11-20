@@ -44,17 +44,32 @@ const DEFAULT_TON_V3_BASE = 'https://toncenter.com/api/v3';
 const DEFAULT_SOL_RPC = 'https://api.mainnet-beta.solana.com';
 const DEFAULT_PI_HORIZON = 'https://api.mainnet.minepi.com';
 
-const SOLANA_USDT_MINT =
-  (process.env.SOL_USDT_MINT || '').trim() || 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
-const SOLANA_USDC_MINT =
-  (process.env.SOL_USDC_MINT || '').trim() || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+function getSolanaUsdtMint(): string {
+  return (process.env.SOL_USDT_MINT || '').trim() || 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+}
 
-const TON_USDT_MASTER_RAW = Address.parse(
-  (process.env.TON_USDT_MASTER || '').trim() || 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs'
-).toRawString();
-const TON_USDC_MASTER_RAW = (process.env.TON_USDC_MASTER || '').trim()
-  ? Address.parse((process.env.TON_USDC_MASTER || '').trim()).toRawString()
-  : '';
+function getSolanaUsdcMint(): string {
+  return (process.env.SOL_USDC_MINT || '').trim() || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+}
+
+function getTonUsdtMasterRaw(): string {
+  const raw = (process.env.TON_USDT_MASTER || '').trim() || 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs';
+  try {
+    return Address.parse(raw).toRawString();
+  } catch {
+    return '';
+  }
+}
+
+function getTonUsdcMasterRaw(): string {
+  const raw = (process.env.TON_USDC_MASTER || '').trim();
+  if (!raw) return '';
+  try {
+    return Address.parse(raw).toRawString();
+  } catch {
+    return '';
+  }
+}
 
 function isObviouslyFakeHash(txHash: string): boolean {
   return isObviouslyFakeTxReference(txHash, 8);
@@ -131,7 +146,7 @@ export function canVerifyPayoutAssetIndependently(
 
   if (asset === 'USDT' || asset === 'USDC') {
     if (isValidTonAddressFormat(dest)) {
-      const masterRaw = asset === 'USDT' ? TON_USDT_MASTER_RAW : TON_USDC_MASTER_RAW;
+      const masterRaw = asset === 'USDT' ? getTonUsdtMasterRaw() : getTonUsdcMasterRaw();
       if (!masterRaw) {
         return {
           verifiable: false,
@@ -413,7 +428,7 @@ async function verifyTonJettonTransactionOnChain(
   asset: 'USDT' | 'USDC'
 ): Promise<OnchainVerifyResult> {
   const cleanHash = input.txHash.trim();
-  const expectedMasterRaw = asset === 'USDT' ? TON_USDT_MASTER_RAW : TON_USDC_MASTER_RAW;
+  const expectedMasterRaw = asset === 'USDT' ? getTonUsdtMasterRaw() : getTonUsdcMasterRaw();
   if (!expectedMasterRaw) {
     return {
       verified: false,
@@ -631,7 +646,7 @@ async function verifySolanaSplTransactionOnChain(
   const cleanHash = input.txHash.trim();
   const dest = input.destinationAddress.trim();
   const rpcUrl = (process.env.SOL_RPC_URL || process.env.SOL_RPC || DEFAULT_SOL_RPC).trim();
-  const expectedMint = asset === 'USDT' ? SOLANA_USDT_MINT : SOLANA_USDC_MINT;
+  const expectedMint = asset === 'USDT' ? getSolanaUsdtMint() : getSolanaUsdcMint();
 
   if (!isValidSolanaAddressFormat(dest)) {
     return { verified: false, network: 'SOLANA_SPL', reason: 'INVALID_SOL_DESTINATION_ADDRESS' };

@@ -35,6 +35,8 @@ export interface TonDispatchResult {
   requestId: string;
   attemptId?: string;
   dispatchState?: string;
+  requiresReconciliation?: boolean;
+  reconciliationStatus?: 'RICHIEDE RICONCILIAZIONE';
   txHash?: string;
   explorerUrl?: string;
   fromWallet?: string;
@@ -223,11 +225,19 @@ export class TonPayoutWorker {
       attemptId,
     });
     if (!claim.ok) {
+      const uncertainClaim =
+        claim.dispatch_state === 'UNCERTAIN_TIMEOUT' ||
+        claim.dispatch_state === 'BROADCASTING' ||
+        claim.dispatch_state === 'CLAIMED' ||
+        claim.error === 'PAYOUT_RESEND_BLOCKED_UNCERTAIN_OR_CONFIRMED_OUTCOME';
       return {
         ok: false,
         requestId: input.requestId,
         attemptId: claim.active_attempt_id,
         dispatchState: claim.dispatch_state,
+        ...(uncertainClaim
+          ? { requiresReconciliation: true, reconciliationStatus: 'RICHIEDE RICONCILIAZIONE' as const }
+          : {}),
         txHash: claim.tx_hash,
         error: claim.error || 'PAYOUT_CLAIM_REJECTED',
       };
@@ -363,6 +373,8 @@ export class TonPayoutWorker {
           requestId: input.requestId,
           attemptId: effectiveAttemptId,
           dispatchState: 'UNCERTAIN_TIMEOUT',
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           fromWallet,
           error: 'TON_TX_NOT_CONFIRMED_ON_CHAIN_UNCERTAIN',
         };
@@ -391,6 +403,8 @@ export class TonPayoutWorker {
           requestId: input.requestId,
           attemptId: effectiveAttemptId,
           dispatchState: 'UNCERTAIN_TIMEOUT',
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           fromWallet,
           txHash: confirmedTxHash,
           error: independentCheck.reason || 'TON_INDEPENDENT_VERIFICATION_FAILED',
@@ -482,6 +496,9 @@ export class TonPayoutWorker {
         requestId: input.requestId,
         attemptId: effectiveAttemptId,
         dispatchState: broadcastEntered ? 'UNCERTAIN_TIMEOUT' : 'FAILED_SAFE_RETRYABLE',
+        ...(broadcastEntered
+          ? { requiresReconciliation: true, reconciliationStatus: 'RICHIEDE RICONCILIAZIONE' as const }
+          : {}),
         error: err?.message || 'TON_RPC_DISPATCH_ERROR',
       };
     }
@@ -542,6 +559,8 @@ export class TonPayoutWorker {
           requestId: reqId,
           attemptId,
           dispatchState: String(row.dispatch_state || 'UNCERTAIN_TIMEOUT'),
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           error: 'TON_TX_NOT_FOUND_DURING_RECONCILIATION_RESEND_BLOCKED',
         });
         continue;
@@ -561,6 +580,8 @@ export class TonPayoutWorker {
           requestId: reqId,
           attemptId,
           dispatchState: String(row.dispatch_state || 'UNCERTAIN_TIMEOUT'),
+          requiresReconciliation: true,
+          reconciliationStatus: 'RICHIEDE RICONCILIAZIONE',
           txHash: candidateHash,
           error: check.reason || 'TON_RECONCILIATION_VERIFICATION_FAILED',
         });

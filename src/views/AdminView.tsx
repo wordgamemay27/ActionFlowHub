@@ -31,6 +31,7 @@ import {
   type CountryEconomicProfile,
 } from '../lib/geoEconomics';
 import { isObviouslyFakeTxReference } from '../lib/txRefValidation';
+import { isSafeExternalHttpsUrl } from '../utils/navigation';
 
 interface DbPayoutRow {
   request_id: string;
@@ -45,6 +46,8 @@ interface DbPayoutRow {
   payout_channel: 'CASH_LOCAL' | 'CRYPTO_DIRECT';
   wallet_address: string;
   status: 'PENDING' | 'APPROVED' | 'COMPLETED' | 'REJECTED';
+  dispatch_state?: string;
+  dispatch_uncertainty_reason?: string | null;
   tx_hash: string | null;
   created_at: string;
 }
@@ -715,15 +718,18 @@ export const AdminView: React.FC<AdminViewProps> = ({
                         <span>+{p.userPoints} PT</span>
                       </span>
                     )}
-                    <a
-                      href={p.directUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="p-1.5 rounded-lg bg-white/5 hover:bg-sky-500/20 text-sky-300"
-                      title="Apri URL Fornitore"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
+                    {isSafeExternalHttpsUrl(p.directUrl) && (
+                      <a
+                        href={p.directUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        referrerPolicy="no-referrer"
+                        className="p-1.5 rounded-lg bg-white/5 hover:bg-sky-500/20 text-sky-300"
+                        title="Apri URL Fornitore"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    )}
                   </div>
                 </div>
               ))}
@@ -749,15 +755,18 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   <div className="text-[11px] text-slate-300 truncate">{mail.scope}</div>
                 </div>
               </div>
-              <a
-                href={mail.portalUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-3 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-400/40 text-xs font-bold text-indigo-200 flex items-center gap-1.5 shrink-0"
-              >
-                <span>Apri</span>
-                <ExternalLink className="w-3.5 h-3.5" />
-              </a>
+              {isSafeExternalHttpsUrl(mail.portalUrl) && (
+                <a
+                  href={mail.portalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  referrerPolicy="no-referrer"
+                  className="px-3 py-1.5 rounded-xl bg-indigo-600/30 border border-indigo-400/40 text-xs font-bold text-indigo-200 flex items-center gap-1.5 shrink-0"
+                >
+                  <span>Apri</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              )}
             </div>
           ))}
         </div>
@@ -1111,6 +1120,11 @@ export const AdminView: React.FC<AdminViewProps> = ({
                         </div>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
+                        {p.dispatch_state === 'UNCERTAIN_TIMEOUT' && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-black text-rose-200 bg-rose-600/30 border border-rose-400/50">
+                            RICHIEDE RICONCILIAZIONE
+                          </span>
+                        )}
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold text-amber-300 bg-amber-500/20 border border-amber-500/30">
                           {p.status}
                         </span>

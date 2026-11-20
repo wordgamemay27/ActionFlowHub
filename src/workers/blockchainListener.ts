@@ -4,6 +4,7 @@ import { dbPool, LedgerService } from '../db/ledgerService';
 import { ProviderReputationService } from '../services/providerReputation';
 import { SettlementService } from '../db/settlementService';
 import { WALLET_CONFIG } from '../config/wallets';
+import { resolveSolanaAllAccountKeys } from '../services/onchainVerifier';
 
 interface BlockchainConfig {
   ton: { rpc: string; enabled: boolean };
@@ -444,10 +445,8 @@ export async function checkSolanaDeposits(): Promise<void> {
       });
       if (!parsedTx || !parsedTx.meta) continue;
 
-      const accountKeys = parsedTx.transaction.message.accountKeys;
-      const targetIndex = accountKeys.findIndex(
-        (k: any) => (k.pubkey ? k.pubkey.toBase58() : String(k)) === CONFIG.solAddress
-      );
+      const accountKeys = resolveSolanaAllAccountKeys(parsedTx);
+      const targetIndex = accountKeys.indexOf(CONFIG.solAddress);
       if (targetIndex < 0) {
         await markTxProcessed(sigInfo.signature);
         continue;
