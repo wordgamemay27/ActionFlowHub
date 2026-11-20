@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { Pool } from 'pg';
 import dotenv from 'dotenv';
@@ -86,24 +87,35 @@ export async function bootstrapDatabaseSchema(): Promise<{
     await client.query(`
       CREATE TABLE IF NOT EXISTS core.schema_migrations (
         filename TEXT PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        content_hash TEXT
       )
     `);
 
-    const appliedRes = await client.query(`SELECT filename FROM core.schema_migrations`);
-    const alreadyApplied = new Set<string>(appliedRes.rows.map((r) => String(r.filename)));
+    await client.query(`
+      ALTER TABLE core.schema_migrations ADD COLUMN IF NOT EXISTS content_hash TEXT
+    `);
+
+    const appliedRes = await client.query(`SELECT filename, content_hash FROM core.schema_migrations`);
+    const alreadyApplied = new Map<string, string | null>(appliedRes.rows.map((r) => [String(r.filename), r.content_hash ? String(r.content_hash) : null]));
 
     for (const file of files) {
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      const hash = crypto.createHash('sha256').update(sql).digest('hex');
+
       if (alreadyApplied.has(file)) {
+        const storedHash = alreadyApplied.get(file);
+        if (storedHash && storedHash !== hash) {
+          console.warn(`[DB MIGRATION] WARNING: ${file} was modified after application (hash mismatch). Skipping.`);
+        }
         skipped.push(file);
         continue;
       }
 
-      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
       await client.query(sql);
       await client.query(
-        `INSERT INTO core.schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING`,
-        [file]
+        `INSERT INTO core.schema_migrations (filename, content_hash) VALUES ($1, $2) ON CONFLICT (filename) DO UPDATE SET content_hash = $2`,
+        [file, hash]
       );
       applied.push(file);
       console.info(`[DB MIGRATION] Applicata con successo: ${file}`);
