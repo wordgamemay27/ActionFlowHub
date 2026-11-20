@@ -9,11 +9,13 @@ export interface BatchSettlementInput {
   actualNetReceivedUsd: number;
   haircutRatio: number;
   onchainTxHash: string;
+  receivedAsset?: string;
 }
 
 export interface BatchSettlementResult {
   success: boolean;
   batchId: string;
+  receivedAsset?: string;
   eventsSettled?: number;
   pointsCreditedToUsers?: number;
   releasedToWithdrawablePoints?: number;
@@ -36,9 +38,27 @@ export class SettlementService {
       };
     }
 
+    const receivedAsset = String(input.receivedAsset || 'USDT').trim().toUpperCase();
+    const VALID_ASSETS = new Set([
+      'TON',
+      'SOL',
+      'PI',
+      'USDT',
+      'USDC',
+      'CASH_AIRTM',
+      'CASH_PAYEER',
+      'CASH_VOLET',
+    ]);
+    if (!VALID_ASSETS.has(receivedAsset)) {
+      return {
+        success: false,
+        batchId: input.batchId,
+        error: 'UNSUPPORTED_SETTLEMENT_ASSET',
+      };
+    }
     try {
       const res = await dbPool.query(
-        `SELECT core.execute_batch_settlement($1, $2, $3::bigint, $4::bigint, $5::numeric, $6::numeric, $7::numeric, $8::text) AS result`,
+        `SELECT core.execute_batch_settlement($1, $2, $3::bigint, $4::bigint, $5::numeric, $6::numeric, $7::numeric, $8::text, $9::text) AS result`,
         [
           input.batchId,
           input.partnerId,
@@ -48,6 +68,7 @@ export class SettlementService {
           input.actualNetReceivedUsd,
           input.haircutRatio,
           input.onchainTxHash,
+          receivedAsset,
         ]
       );
 
@@ -70,6 +91,7 @@ export class SettlementService {
       return {
         success: true,
         batchId: input.batchId,
+        receivedAsset: String(data.received_asset || receivedAsset),
         eventsSettled: Number(data.settled_users_count || 0),
         pointsCreditedToUsers: totalSettledPts,
         releasedToWithdrawablePoints: unallocatedPts,
@@ -136,5 +158,78 @@ export class SettlementService {
       totalUserSettledPoints: Number(r.total_user_settled_points || 0),
       isSolvent: netWithdrawableCapacityPoints >= totalUserWithdrawableAndReservedPoints,
     };
+  }
+
+  static async getTreasuryAssetBreakdown(): Promise<
+    Array<{
+      asset: string;
+      actualCashOnChainUsd: number;
+      disbursedUsd: number;
+      pointsCapacity: number;
+      disbursedPoints: number;
+      reservedBufferPercent: number;
+      grossRemainingPoints: number;
+      netWithdrawablePoints: number;
+      approvedPendingPoints: number;
+      availableAfterApprovedPoints: number;
+      reserved15PctPoints: number;
+      updatedAt: string | null;
+    }>
+  > {
+    if (!dbPool) return [];
+    try {
+      const res = await dbPool.query(`SELECT * FROM core.v_treasury_vault_status`);
+      return res.rows.map((r) => {
+        const grossRem = Number(r.gross_remaining_points || 0);
+        const netWithdrawable = Number(r.net_withdrawable_points || 0);
+        const approvedPending = Number(r.approved_pending_points || 0);
+        return {
+          asset: String(r.asset),
+          actualCashOnChainUsd: Number(r.actual_cash_on_chain || 0),
+          disbursedUsd: Number(r.disbursed_usd || 0),
+          pointsCapacity: Number(r.points_equivalent_capacity || 0),
+          disbursedPoints: Number(r.disbursed_points || 0),
+          reservedBufferPercent: Number(r.reserved_buffer_percent ?? 0.15),
+          grossRemainingPoints: grossRem,
+          netWithdrawablePoints: netWithdrawable,
+          approvedPendingPoints: approvedPending,
+          availableAfterApprovedPoints: Number(
+            r.available_after_approved_points ?? Math.max(0, netWithdrawable - approvedPending)
+          ),
+          reserved15PctPoints: Number(
+            r.reserved_15pct_points ?? Math.max(0, grossRem - netWithdrawable)
+          ),
+          updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+        };
+      });
+    } catch {
+      const res = await dbPool.query(
+        `SELECT asset, actual_cash_on_chain, disbursed_usd, points_equivalent_capacity, disbursed_points, reserved_buffer_percent, updated_at
+           FROM core.treasury_vault
+          ORDER BY asset ASC`
+      );
+      return res.rows.map((r) => {
+        const grossRem = Math.max(
+          0,
+          Number(r.points_equivalent_capacity || 0) - Number(r.disbursed_points || 0)
+        );
+        const buf = Number(r.reserved_buffer_percent ?? 0.15);
+        const netW = Math.floor(grossRem * (1 - buf));
+        return {
+          asset: String(r.asset),
+          actualCashOnChainUsd: Number(r.actual_cash_on_chain || 0),
+          disbursedUsd: Number(r.disbursed_usd || 0),
+          pointsCapacity: Number(r.points_equivalent_capacity || 0),
+          disbursedPoints: Number(r.disbursed_points || 0),
+          reservedBufferPercent: buf,
+          grossRemainingPoints: grossRem,
+          netWithdrawablePoints: netW,
+          approvedPendingPoints: 0,
+          availableAfterApprovedPoints: netW,
+          reserved15PctPoints: Math.max(0, grossRem - netW),
+          updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+        };
+      });
+    }
   }
 }

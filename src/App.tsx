@@ -9,7 +9,7 @@
 // 5. Home con Sessione Unica, tracciamento singole interazioni S2S e saldi reali PostgreSQL
 // ============================================================================
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   UserProfile,
   Transaction,
@@ -97,6 +97,8 @@ const ActionFlowInner: React.FC = () => {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [adminToken, setAdminToken] = useState<string>('');
+  const inFlightWithdrawalRef = useRef<boolean>(false);
+  const pendingWithdrawalKeyRef = useRef<{ signature: string; key: string } | null>(null);
 
   const refreshAuthoritativeBalances = useCallback(async () => {
     const initData = getTelegramInitData();
@@ -391,9 +393,20 @@ const ActionFlowInner: React.FC = () => {
 
   const handleRequestWithdrawal = useCallback(
     async (points: number, wallet: string, asset: string = 'TON'): Promise<WithdrawalResult> => {
+      if (inFlightWithdrawalRef.current) {
+        return { ok: false, error: 'WITHDRAWAL_ALREADY_IN_FLIGHT' };
+      }
+      inFlightWithdrawalRef.current = true;
       try {
         const initData = getTelegramInitData();
-        const idempotencyKey = `wd_${user.telegramId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const sig = `${user.telegramId}:${Math.floor(Number(points || 0))}:${String(asset || 'TON').trim().toUpperCase()}:${wallet.trim()}`;
+        if (!pendingWithdrawalKeyRef.current || pendingWithdrawalKeyRef.current.signature !== sig) {
+          pendingWithdrawalKeyRef.current = {
+            signature: sig,
+            key: `wd_${user.telegramId}_${globalThis.crypto.randomUUID()}`,
+          };
+        }
+        const idempotencyKey = pendingWithdrawalKeyRef.current.key;
         const res = await fetch('/api/payout/request', {
           method: 'POST',
           headers: {
@@ -410,12 +423,16 @@ const ActionFlowInner: React.FC = () => {
         });
         const responseData = await res.json().catch(() => ({}));
         if (!res.ok || !responseData?.ok) {
+          if (res.status >= 400 && res.status < 500) {
+            pendingWithdrawalKeyRef.current = null;
+          }
           return {
             ok: false,
             error: String(responseData?.error || `HTTP_${res.status}`),
             strikeRecord: responseData?.strikeRecord,
           };
         }
+        pendingWithdrawalKeyRef.current = null;
         await refreshAuthoritativeBalances();
         return { ok: true };
       } catch (e: any) {
@@ -423,6 +440,8 @@ const ActionFlowInner: React.FC = () => {
           ok: false,
           error: e?.message || 'NETWORK_ERROR',
         };
+      } finally {
+        inFlightWithdrawalRef.current = false;
       }
     },
     [user.telegramId, refreshAuthoritativeBalances]

@@ -64,7 +64,8 @@ Stack: **React 19 · Vite 8 · TypeScript 7 · Tailwind 4 · Express · PostgreS
   - `GET /api/providers/prioritized?country=..&category=..`
   - `POST /api/interactions/register`, `POST /api/affiliate/click`
   - `GET|POST /api/webhook/postback`
-  - `POST /api/payout/request`, `GET /api/payout/list`, `POST /api/payout/disburse`, `POST /api/payout/process-ton`, `POST /api/payout/process-all`
+  - `POST /api/payout/idempotency-key`, `POST /api/payout/request`, `GET /api/payout/list`, `POST /api/payout/disburse`, `POST /api/payout/process-ton`, `POST /api/payout/process-all`, `POST /api/payout/reconcile-uncertain`
+  - `GET|POST /api/admin/providers/thresholds/config`, `POST /api/admin/providers/:id/rate-limit`, `POST /api/admin/providers/:id/review`
   - `POST /api/settlement/execute`, `POST /api/settlement/release-withdrawable`, `GET /api/audit/ledger-integrity`
 
 ---
@@ -83,3 +84,18 @@ Prima di ogni intervento, leggere le specifiche aggiornate in `docs/` e verifica
 * `001` – `010`: Schema `core`, double-entry a 4 bucket (`PENDING`, `SETTLED`, `WITHDRAWABLE`, `RESERVED`), reset timezone-aware, postback verificati S2S, reputazione fornitori, batch settlement con haircut, `v_treasury_solvency` e `request_payout_atomic`.
 * `011_geo_country_lock_and_provider_ranking.sql`: Lock persistente `market_country`, associazione deterministica `core.resolve_country_tier_zone(p_country)` e vista `core.v_prioritized_providers` (da applicare separatamente previa autorizzazione su Neon).
 * `012_worldbank_ppp_and_reward_formula.sql`: Tabella `core.country_economic_profiles` (36 Paesi con coefficienti World Bank WDI), `core.get_country_ppp_coefficient`, precisione `NUMERIC(6,4)` su `core.users.ppp_multiplier`, formula PPP su `core.record_verified_interaction_postback` + margine piattaforma tracciato e `completion_rate` su `core.v_prioritized_providers` (preparata senza eseguire su Neon).
+* `013_multi_asset_treasury_killswitch_limits_clawback.sql` & `014_audit_hardening_fixes.sql`: Tesoreria separata per ciascuno degli 8 asset (`TON`, `SOL`, `PI`, `USDT`, `USDC`, `CASH_PAYEER`, `CASH_AIRTM`, `CASH_VOLET`), conversioni tracciate con `external_tx_ref` univoco, Kill Switch globale fail-closed, doppia approvazione admin, coda settlement durevole (`core.settlement_jobs`) e recupero automatico debiti post-clawback.
+* `015_inbound_security_and_session_revocation.sql`: Tabella e funzione `core.inbound_security_logs` / `core.log_inbound_security_event` con categorie di anomalia proporzionate, revoca atomica sessioni `core.revoke_auto_session` (stato `REVOKED` + blocco nuovi postback su `core.record_verified_interaction_postback`), allineamento `cpx` a `BANNED`/`REVOKED` e ruolo DB `actionflow_auditor` a minimo privilegio.
+* `016_persistent_rate_limit_provider_thresholds_killswitch.sql`: Rate limit persistente su PostgreSQL (`core.provider_rate_limits` / `core.consume_provider_rate_limit` con default `10 req/min`), categoria `FRAUDULENT_ACTIVITY`, soglie automatiche proporzionate (`PROVIDER_PROTECTION_THRESHOLDS`: `WARNING=3`, `QUARANTINE=5`, `BANNED` esclusivamente admin), isolamento `TECHNICAL_ERROR`, revisione admin `core.admin_review_provider_anomalies` e colonne di approvazione/riserva estese su `core.v_treasury_vault_status`.
+* `017_payout_idempotency_payload_conflict.sql`: Hash SHA-256 del payload payout (`request_payload_hash`) ed enforcement SQL in `core.request_payout_atomic` con errore `IDEMPOTENCY_KEY_PAYLOAD_CONFLICT` (HTTP `409`).
+* `018_onchain_verification_tracking.sql`: Tabella `core.payout_onchain_verifications`, funzione `core.record_payout_onchain_verification` e blocco fail-closed in `core.complete_payout_atomic` finché la prova on-chain non è registrata e verificata (`ONCHAIN_PROOF_NOT_RECORDED_OR_UNVERIFIED`).
+* `019_treasury_sql_and_session_rollback_hardening.sql`: Registro `core.schema_migrations` (`001`–`020` ↔ Kilo `013`–`020`), trigger append-only su log di sicurezza, ruolo operativo `actionflow_app`, rollback automatico punti alla revoca sessione (`core.revoke_auto_session`), lock deadlock-safe in `execute_batch_settlement` / `release_settled_to_withdrawable_for_user` (+ wrapper `core.release_settled`) e cross-check completo prove on-chain in `complete_payout_atomic`.
+* `020_payout_dispatch_claims_and_double_spend_guard.sql`: Protezione persistente anti-double-spend su PostgreSQL con claim atomico pre-trasmissione (`core.claim_payout_for_dispatch`), stato persistente della trasmissione e indice univoco parziale (`idx_payout_dispatch_one_blocking_attempt`), divieto di reinvio su esito incerto, audit immutabile (`core.payout_dispatch_audit`) e riconciliazione RPC (`core.get_uncertain_payout_dispatches`).
+
+---
+
+## Documentazione Architetturale, Sicurezza e Operazioni (`docs/`)
+
+* [`docs/ACTIONFLOW_ARCHITECTURE_AND_SECURITY.md`](docs/ACTIONFLOW_ARCHITECTURE_AND_SECURITY.md): Analisi tecnica integrale aggiornata di `AutoInteractiveCycleEngine`, sicurezza inbound & HMAC raw-body/sunset, rate limiting persistente PostgreSQL, core crediti a 4 conti, tesoreria separata su 8 asset, idempotenza payout, custodia `MANUAL_EXTERNAL`, verificabilità indipendente (TON, Solana legacy/v0 ALT, PI, USDT/USDC/CASH_*), protezione double-spend (`020`) e mappa dei collegamenti end-to-end.
+* [`docs/ACTIONFLOW_OPERATIONS_AND_MIGRATIONS.md`](docs/ACTIONFLOW_OPERATIONS_AND_MIGRATIONS.md): Registro migrazioni (`001`–`020` ↔ Kilo `013`–`020`), configurazione variabili d'ambiente, procedura di backup/rollback su Neon e matrice di stato dei test.
+

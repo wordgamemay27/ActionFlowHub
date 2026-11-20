@@ -401,6 +401,7 @@ export async function checkTonDeposits(): Promise<void> {
             actualNetReceivedUsd: usdEstimate,
             haircutRatio: 1.0,
             onchainTxHash: txHash,
+            receivedAsset: 'TON',
           });
 
           if (settleRes.success || settleRes.error === 'SETTLEMENT_TX_HASH_ALREADY_USED') {
@@ -477,6 +478,7 @@ export async function checkSolanaDeposits(): Promise<void> {
         actualNetReceivedUsd: usdEstimate,
         haircutRatio: 1.0,
         onchainTxHash: sigInfo.signature,
+        receivedAsset: 'SOL',
       });
 
       if (settleRes.success || settleRes.error === 'SETTLEMENT_TX_HASH_ALREADY_USED') {

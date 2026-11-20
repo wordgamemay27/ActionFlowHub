@@ -170,10 +170,11 @@ export function lookupReputation(
 }
 
 export function isProviderReputationEligible(
-  rep?: ProviderReputationSnapshot
+  rep?: ProviderReputationSnapshot,
+  requireRegistered = false
 ): boolean {
-  if (!rep) return true;
-  return rep.status !== 'QUARANTINE' && rep.status !== 'BANNED';
+  if (!rep) return !requireRegistered;
+  return rep.status === 'ACTIVE' || rep.status === 'WARNING';
 }
 
 function isAllowedByBannedKeywords(parts: Array<string | undefined>): boolean {
@@ -189,17 +190,22 @@ export function sortProvidersByPriority<T extends VerifiedProviderItem>(
   providers: T[],
   userCountry?: string | null,
   reputationMap?: Record<string, ProviderReputationSnapshot>,
-  options?: { excludeIncompatibleGeo?: boolean; activityCategory?: string }
+  options?: {
+    excludeIncompatibleGeo?: boolean;
+    activityCategory?: string;
+    requireRegisteredReputation?: boolean;
+  }
 ): T[] {
   const normalizedCountry = normalizeCountryCode(userCountry);
   const excludeIncompatible = Boolean(options?.excludeIncompatibleGeo);
+  const requireRegistered = Boolean(options?.requireRegisteredReputation);
 
   const filtered = providers.filter((p) => {
     if (!isAllowedByBannedKeywords([p.id, p.name, p.directUrl, p.shortDescription])) {
       return false;
     }
     const rep = lookupReputation(p.id, options?.activityCategory, reputationMap);
-    if (!isProviderReputationEligible(rep)) return false;
+    if (!isProviderReputationEligible(rep, requireRegistered)) return false;
     if (excludeIncompatible && !isProviderGeoCompatible(p.geoRegion, normalizedCountry)) {
       return false;
     }
@@ -267,23 +273,37 @@ export function sortProvidersByPriority<T extends VerifiedProviderItem>(
 /**
  * Costruisce la playlist prioritizzata per `UNIFIED_AUTO` applicando tutti i 7 criteri:
  * - Esclude offerte bloccate (`isLocked`), `QUARANTINE`/`BANNED` e offerte regionali incompatibili.
- * - Mantiene sempre le categorie scelte dall'utente in onboarding (con fallback completo se vuoto).
+ * - Se `requireRegisteredReputation` e' attivo (DB connesso), ammette solo provider registrati `ACTIVE`/`WARNING`.
+ * - Se `authorizedProviderIds` e' presente, verifica l'esistenza di campagne/fornitori realmente attivi.
  */
 export function buildPrioritizedAutoCycleSteps(
   candidates: CycleStepCandidate[],
   selectedCategories: string[] | null | undefined,
   userCountry?: string | null,
-  reputationMap?: Record<string, ProviderReputationSnapshot>
+  reputationMap?: Record<string, ProviderReputationSnapshot>,
+  options?: {
+    requireRegisteredReputation?: boolean;
+    authorizedProviderIds?: ReadonlySet<string> | null;
+  }
 ): PrioritizedCycleStep[] {
   const normalizedCountry = normalizeCountryCode(userCountry);
+  const requireRegistered = Boolean(options?.requireRegisteredReputation);
+  const authSet = options?.authorizedProviderIds;
 
   const nonBannedEligible = (step: CycleStepCandidate) => {
     if (step.isLocked) return false;
     if (!isAllowedByBannedKeywords([step.providerId, step.providerLabel, step.targetUrl])) {
       return false;
     }
+    const canonical = resolveCanonicalProviderId(step.providerId, step.activityCategory);
+    if (authSet) {
+      const rawLower = step.providerId.toLowerCase();
+      if (!authSet.has(rawLower) && !authSet.has(canonical)) {
+        return false;
+      }
+    }
     const rep = lookupReputation(step.providerId, step.activityCategory, reputationMap);
-    return isProviderReputationEligible(rep);
+    return isProviderReputationEligible(rep, requireRegistered);
   };
 
   const eligible = candidates.filter(
@@ -291,6 +311,10 @@ export function buildPrioritizedAutoCycleSteps(
       nonBannedEligible(step) &&
       isProviderGeoCompatible(step.geoRegion || 'GLOBAL', normalizedCountry)
   );
+
+  if (requireRegistered && eligible.length === 0) {
+    return [];
+  }
 
   const pool =
     eligible.length > 0 ? eligible : candidates.filter((s) => nonBannedEligible(s));

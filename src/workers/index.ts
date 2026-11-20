@@ -36,12 +36,15 @@ export const workers = {
     isValidTonAddress: (address: string) => tonPayoutWorker.isValidTonAddress(address),
     executeRealTonPayout: (input: TonDispatchInput) => tonPayoutWorker.executeRealTonPayout(input),
     processApprovedTonPayouts: () => tonPayoutWorker.processApprovedTonPayouts(),
+    reconcileUncertainTonPayouts: () => tonPayoutWorker.reconcileUncertainTonPayouts(),
     getMetrics: () => TonPayoutWorker.getMetrics(),
+    getStatus: () => tonPayoutWorker.getStatus(),
   },
   multiAssetPayout: {
     dispatchApprovedPayout: (input: MultiAssetDispatchInput) =>
       multiAssetPayoutWorker.dispatchApprovedPayout(input),
     processApprovedPayouts: () => multiAssetPayoutWorker.processApprovedPayouts(),
+    reconcileUncertainPayouts: () => multiAssetPayoutWorker.reconcileUncertainPayouts(),
     getStatus: () => multiAssetPayoutWorker.getStatus(),
   },
   settlement: {

@@ -15,6 +15,10 @@ import { WALLET_CONFIG } from './config/wallets';
 import { workers } from './workers';
 import { refreshAndGetFxQuote } from './workers/blockchainListener';
 import {
+  canVerifyPayoutAssetIndependently,
+  verifyPayoutTransactionOnChain,
+} from './services/onchainVerifier';
+import {
   normalizeCountryCode,
   resolveCountryEconomicProfile,
   listCountryEconomicProfiles,
@@ -22,9 +26,11 @@ import {
   isNoRestrictionProvider,
 } from './lib/geoEconomics';
 import { refreshWorldBankPppFromApi } from './services/worldBankPpp';
+import { isObviouslyFakeTxReference } from './lib/txRefValidation';
 import { sortProvidersByPriority } from './lib/providerPriority';
 import {
   ALL_VERIFIED_DIRECT_PROVIDERS,
+  BANNED_PROVIDER_KEYWORDS,
   VERIFIED_GAMES_PROVIDERS,
   VERIFIED_SOAP_PROVIDERS,
   VERIFIED_MUSIC_PROVIDERS,
@@ -33,6 +39,15 @@ import {
   VERIFIED_OCR_PROVIDERS,
   VERIFIED_DEPIN_PROVIDERS,
 } from './lib/verifiedDirectProviders';
+import {
+  type InboundAnomalyCategory,
+  findUnexpectedKeys,
+  validatePartnerTrackingUrl,
+  verifyWebhookHmacSignature,
+  verifyWebhookRawBodyHmac,
+  checkLegacyWebhookTransition,
+  buildCanonicalWebhookPayload,
+} from './lib/inboundSecurity';
 
 const TELEGRAM_AUTH_MAX_AGE_SECONDS = 300;
 const ALLOWED_CATEGORIES = new Set([
@@ -208,7 +223,14 @@ export function createExpressApp() {
       crossOriginEmbedderPolicy: false,
     })
   );
-  app.use(express.json({ limit: '64kb', verify: (req: any, _res, buf) => { req.rawBody = buf; } }));
+  app.use(
+    express.json({
+      limit: '64kb',
+      verify: (req, _res, buf) => {
+        (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+      },
+    })
+  );
   app.use(express.static(path.resolve(process.cwd(), 'public')));
 
   const generalApiLimiter = rateLimit({
@@ -243,16 +265,98 @@ export function createExpressApp() {
     message: { ok: false, error: 'WEBHOOK_RATE_LIMIT_EXCEEDED' },
   });
 
-  const perProviderRateLimit = new Map<string, { count: number; resetAt: number }>();
-  const payoutIdempotencyFingerprints = new Map<string, string>();
+  const INTERACTION_ALLOWED_BODY_KEYS = new Set([
+    'providerId',
+    'partnerId',
+    'taskId',
+    'task_id',
+    'activityCategory',
+    'category',
+    'trackingUrl',
+    'expectedGrossUsd',
+    'clickId',
+    'interactionId',
+    'sessionId',
+    'initData',
+  ]);
+
+  const WEBHOOK_ALLOWED_KEYS = new Set([
+    'secret',
+    'status',
+    'provider',
+    'partnerId',
+    'userId',
+    'subId',
+    'sub_id',
+    'click_id',
+    'clickId',
+    'interaction_id',
+    'interactionId',
+    'txId',
+    'conversionId',
+    'eventId',
+    'nonce',
+    'webhookNonce',
+    'payout',
+    'revenue',
+  ]);
 
   app.use('/api', generalApiLimiter);
 
-  function requireAdmin(req: Request, res: Response, next: () => void) {
-    const token = req.header('x-admin-token') || '';
-    const expected = process.env.ADMIN_API_TOKEN || '';
-    if (expected && safeTokenEquals(token, expected)) {
-      return next();
+  function parseAdminOperatorTokenMap(): Array<{ actor: string; token: string }> {
+    const entries: Array<{ actor: string; token: string }> = [];
+    const primary = (process.env.ADMIN_API_TOKEN || '').trim();
+    if (primary) {
+      entries.push({ actor: 'admin_primary', token: primary });
+    }
+    const secondary = (process.env.ADMIN_SECONDARY_API_TOKEN || '').trim();
+    if (secondary) {
+      const secondaryId = (process.env.ADMIN_SECONDARY_ID || 'admin_secondary').trim().slice(0, 64) || 'admin_secondary';
+      entries.push({ actor: secondaryId, token: secondary });
+    }
+    const rawMap = (process.env.ADMIN_OPERATOR_TOKENS || '').trim();
+    if (rawMap) {
+      if (rawMap.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(rawMap) as Record<string, unknown>;
+          for (const [actorKey, tokVal] of Object.entries(parsed)) {
+            const actor = String(actorKey || '').trim().slice(0, 64);
+            const tok = String(tokVal || '').trim();
+            if (actor && tok) entries.push({ actor, token: tok });
+          }
+        } catch {
+          // Ignore malformed JSON operator map (fail-closed)
+        }
+      } else {
+        for (const pair of rawMap.split(',')) {
+          const idx = pair.indexOf(':');
+          if (idx <= 0) continue;
+          const actor = pair.slice(0, idx).trim().slice(0, 64);
+          const tok = pair.slice(idx + 1).trim();
+          if (actor && tok) entries.push({ actor, token: tok });
+        }
+      }
+    }
+    return entries;
+  }
+
+  function authenticateAdminRequest(req: Request):
+    | { ok: true; actor: string; method: 'TOKEN' | 'TELEGRAM' }
+    | { ok: false; status: number; error: string } {
+    const explicitActor = String(req.header('x-admin-id') || '').trim().slice(0, 64);
+    const token = (req.header('x-admin-token') || '').trim();
+    const operatorEntries = parseAdminOperatorTokenMap();
+
+    if (token) {
+      for (const entry of operatorEntries) {
+        if (safeTokenEquals(token, entry.token)) {
+          if (explicitActor && explicitActor !== entry.actor) {
+            return { ok: false, status: 403, error: 'ADMIN_ACTOR_MISMATCH' };
+          }
+          return { ok: true, actor: entry.actor, method: 'TOKEN' };
+        }
+      }
+      return { ok: false, status: 401, error: 'ADMIN_AUTH_REQUIRED' };
     }
 
     const tgCheck = verifyTelegramWebAppData(extractTelegramInitData(req));
@@ -261,12 +365,34 @@ export function createExpressApp() {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
-      if (admins.includes(String(tgCheck.userData.id))) {
-        return next();
+      const tgActor = `tg_admin_${tgCheck.userData.id}`;
+      if (!admins.includes(String(tgCheck.userData.id))) {
+        return { ok: false, status: 403, error: 'FORBIDDEN' };
       }
+      if (explicitActor && explicitActor !== tgActor) {
+        return { ok: false, status: 403, error: 'ADMIN_ACTOR_MISMATCH' };
+      }
+      return { ok: true, actor: tgActor, method: 'TELEGRAM' };
     }
 
-    return res.status(401).json({ ok: false, error: 'ADMIN_AUTH_REQUIRED' });
+    return { ok: false, status: 401, error: 'ADMIN_AUTH_REQUIRED' };
+  }
+
+  function requireAdmin(req: Request, res: Response, next: () => void) {
+    const auth = authenticateAdminRequest(req);
+    if (!auth.ok) {
+      return res.status(auth.status).json({ ok: false, error: auth.error });
+    }
+    (req as Request & { adminActor?: string }).adminActor = auth.actor;
+    return next();
+  }
+
+  function resolveAdminActor(req: Request): string {
+    const bound = (req as Request & { adminActor?: string }).adminActor;
+    if (bound) return bound;
+    const auth = authenticateAdminRequest(req);
+    if (auth.ok) return auth.actor;
+    throw new Error('UNAUTHENTICATED_ADMIN_ACTOR');
   }
 
   function requireTelegramUser(
@@ -293,25 +419,11 @@ export function createExpressApp() {
   // ADMIN VERIFY
   // ============================================================================
   app.post('/api/admin/verify', adminLimiter, (req: Request, res: Response) => {
-    const tokenHeader = req.header('x-admin-token') || '';
-    const expectedToken = process.env.ADMIN_API_TOKEN || '';
-    if (expectedToken && safeTokenEquals(tokenHeader, expectedToken)) {
-      return res.json({ ok: true, isAdmin: true });
+    const auth = authenticateAdminRequest(req);
+    if (!auth.ok) {
+      return res.status(auth.status).json({ ok: false, isAdmin: false, error: auth.error });
     }
-
-    const tgCheck = verifyTelegramWebAppData(extractTelegramInitData(req));
-    if (!tgCheck.valid || !tgCheck.userData?.id) {
-      return res.status(401).json({ ok: false, isAdmin: false, error: 'ADMIN_AUTH_REQUIRED' });
-    }
-
-    const admins = (process.env.ADMIN_TELEGRAM_IDS || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (!admins.includes(String(tgCheck.userData.id))) {
-      return res.status(403).json({ ok: false, isAdmin: false, error: 'FORBIDDEN' });
-    }
-    return res.json({ ok: true, isAdmin: true });
+    return res.json({ ok: true, isAdmin: true, actor: auth.actor });
   });
 
   // ============================================================================
@@ -698,10 +810,20 @@ export function createExpressApp() {
     const authUser = requireTelegramUser(req, res);
     if (!authUser) return;
 
-    if (!dbPool) {
-      return res.status(503).json({
+    const unexpectedFields = findUnexpectedKeys(req.body, INTERACTION_ALLOWED_BODY_KEYS);
+    if (unexpectedFields.length > 0) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: req.path || '/api/interactions/register',
+        userId: authUser.userId,
+        anomalyCategory: 'SUSPICIOUS_BEHAVIOR',
+        errorCode: 'UNEXPECTED_FIELDS',
+        sourceIp: req.ip,
+        details: { unexpectedFields },
+      });
+      return res.status(400).json({
         ok: false,
-        error: 'POSTGRES_REQUIRED_FOR_INTERACTION_TRACKING',
+        error: 'UNEXPECTED_FIELDS',
+        unexpectedFields,
       });
     }
 
@@ -712,16 +834,6 @@ export function createExpressApp() {
       .toUpperCase();
     const activityCategory = ALLOWED_CATEGORIES.has(rawCat) ? rawCat : 'OTHER';
     const trackingUrl = req.body?.trackingUrl ? String(req.body.trackingUrl).trim() : null;
-    if (trackingUrl) {
-      try {
-        const u = new URL(trackingUrl);
-        if (u.protocol !== 'https:' && u.protocol !== 'http:') {
-          return res.status(400).json({ ok: false, error: 'INVALID_TRACKING_URL_PROTOCOL' });
-        }
-      } catch {
-        return res.status(400).json({ ok: false, error: 'INVALID_TRACKING_URL' });
-      }
-    }
     const expectedGrossUsd = Number(req.body?.expectedGrossUsd || 0);
 
     if (!providerId || !taskId) {
@@ -731,28 +843,79 @@ export function createExpressApp() {
       });
     }
 
-    // Verifica stato fornitore (escludi QUARANTINE/BANNED)
-    if (dbPool) {
-      try {
-        const pr = await dbPool.query(
-          `SELECT status FROM core.provider_reputation WHERE provider_id = $1`,
-          [providerId]
-        );
-        const status = pr.rows[0]?.status;
-        if (!status || status === 'QUARANTINE' || status === 'BANNED') {
-          return res.status(403).json({ ok: false, error: 'PROVIDER_BLOCKED_BY_REPUTATION' });
-        }
-      } catch {
-        // tabella non esiste → ignora (compatibilità)
-      }
+    const bannedHaystack = `${providerId} ${trackingUrl || ''}`.toLowerCase();
+    if (BANNED_PROVIDER_KEYWORDS.some((kw) => bannedHaystack.includes(kw))) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: req.path || '/api/interactions/register',
+        providerId,
+        userId: authUser.userId,
+        anomalyCategory: 'SUSPICIOUS_BEHAVIOR',
+        errorCode: 'PROVIDER_BANNED_BY_POLICY',
+        sourceIp: req.ip,
+      });
+      return res.status(403).json({
+        ok: false,
+        error: 'PROVIDER_BANNED_BY_POLICY',
+      });
+    }
+
+    const urlCheck = validatePartnerTrackingUrl(trackingUrl);
+    if (!urlCheck.valid) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: req.path || '/api/interactions/register',
+        providerId,
+        userId: authUser.userId,
+        anomalyCategory: 'UNAUTHORIZED_URL',
+        errorCode: 'UNAUTHORIZED_TRACKING_URL',
+        sourceIp: req.ip,
+        details: { reason: urlCheck.reason, hostname: urlCheck.hostname || null },
+      });
+      return res.status(400).json({
+        ok: false,
+        error: 'UNAUTHORIZED_TRACKING_URL',
+        detail: urlCheck.reason,
+      });
+    }
+
+    if (!dbPool) {
+      return res.status(503).json({
+        ok: false,
+        error: 'POSTGRES_REQUIRED_FOR_INTERACTION_TRACKING',
+      });
+    }
+
+    const rl = await LedgerService.consumeProviderRateLimit(providerId, 'interactions_register', 10);
+    if (!rl.ok) {
+      return res.status(503).json({
+        ok: false,
+        error: rl.error || 'RATE_LIMIT_DB_UNAVAILABLE',
+        rateLimitMode: rl.mode,
+      });
+    }
+    if (!rl.allowed) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: req.path || '/api/interactions/register',
+        providerId,
+        userId: authUser.userId,
+        anomalyCategory: 'SUSPICIOUS_BEHAVIOR',
+        errorCode: 'PROVIDER_RATE_LIMIT_EXCEEDED',
+        sourceIp: req.ip,
+        details: { limit: rl.limit, currentCount: rl.currentCount, mode: rl.mode },
+      });
+      return res.status(429).json({
+        ok: false,
+        error: 'PROVIDER_RATE_LIMIT_EXCEEDED',
+        limit: rl.limit,
+        rateLimitMode: rl.mode,
+      });
     }
 
     const clickId =
       String(req.body?.clickId || resolveClickIdFromQuery(trackingUrl || '') || '').trim() ||
-      `clk_${authUser.userId}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+      `clk_${authUser.userId}_${crypto.randomUUID()}`;
     const interactionId =
       String(req.body?.interactionId || '').trim() ||
-      `int_${authUser.userId}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+      `int_${authUser.userId}_${crypto.randomUUID()}`;
 
     let sessionId = String(req.body?.sessionId || '').trim();
     if (!sessionId) {
@@ -760,7 +923,7 @@ export function createExpressApp() {
       if (current.session && current.session.status === 'ACTIVE') {
         sessionId = current.session.session_id;
       } else {
-        sessionId = `autosess_${authUser.userId}_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+        sessionId = `autosess_${authUser.userId}_${crypto.randomUUID()}`;
         const created = await LedgerService.startAutoSession({
           sessionId,
           userId: authUser.userId,
@@ -785,7 +948,7 @@ export function createExpressApp() {
       providerId,
       activityCategory,
       taskId,
-      trackingUrl,
+      trackingUrl: urlCheck.normalizedUrl || trackingUrl,
       expectedGrossUsd: Number.isFinite(expectedGrossUsd) && expectedGrossUsd >= 0 ? expectedGrossUsd : 0,
       payload: {
         userAgent: req.header('user-agent') || null,
@@ -796,7 +959,10 @@ export function createExpressApp() {
     if (!result.ok) {
       const err = result.error || 'INTERACTION_REGISTER_FAILED';
       const statusCode =
-        err === 'USER_BLOCKED' || err.includes('PROVIDER_BLOCKED') || err.includes('EXPOSURE')
+        err === 'USER_BLOCKED' ||
+        err.includes('PROVIDER_BLOCKED') ||
+        err.includes('EXPOSURE') ||
+        err.includes('REVOKED')
           ? 403
           : err === 'PROVIDER_NOT_REGISTERED' || err === 'SESSION_NOT_FOUND'
           ? 404
@@ -810,7 +976,7 @@ export function createExpressApp() {
       sessionId,
       interactionId: result.interaction?.interaction_id || interactionId,
       clickId: result.interaction?.click_id || clickId,
-      trackingUrl: result.interaction?.tracking_url || trackingUrl,
+      trackingUrl: result.interaction?.tracking_url || urlCheck.normalizedUrl || trackingUrl,
       status: result.interaction?.status || 'CLICK_REGISTERED',
       userPendingPointsAdded: 0,
       interaction: result.interaction,
@@ -824,51 +990,25 @@ export function createExpressApp() {
   // WEBHOOK S2S VERIFICATO FORNITORI (PostgreSQL + click_id/interaction_id + anti-replay)
   // ============================================================================
   const handlePostback = async (req: Request, res: Response) => {
-    const webhookSecret = process.env.WEBHOOK_SECRET || '';
-    const providedSecret =
-      req.header('x-webhook-secret') || String(req.query.secret || req.body?.secret || '');
-    const providedSignature = req.header('x-webhook-signature') || '';
-    const webhookTimestampRaw =
-      req.header('x-webhook-timestamp') ||
-      String(req.query.timestamp || req.body?.timestamp || '');
-    const webhookTimestamp = Number(webhookTimestampRaw);
-
-    // HMAC con timestamp (nuova firma): signature = HMAC-SHA256(secret, timestamp + "." + rawBody)
-    let hmacValid = false;
-    if (providedSignature && Number.isFinite(webhookTimestamp) && webhookTimestamp > 0) {
-      const rawBody = (req as any).rawBody
-        ? (req as any).rawBody.toString('utf8')
-        : null;
-      if (!rawBody) {
-        hmacValid = false;
-      } else {
-        const message = `${webhookTimestamp}.${rawBody}`;
-        const expected = crypto.createHmac('sha256', webhookSecret).update(message).digest('hex');
-        try {
-          hmacValid =
-            providedSignature.length === expected.length &&
-            crypto.timingSafeEqual(Buffer.from(providedSignature, 'hex'), Buffer.from(expected, 'hex'));
-        } catch {
-          hmacValid = false;
-        }
-        const nowSec = Math.floor(Date.now() / 1000);
-        if (Math.abs(nowSec - webhookTimestamp) > 300) hmacValid = false;
-      }
-    }
-
-    // Firma legacy (solo secret) — transizione controllata
-    const legacyExpiry = process.env.WEBHOOK_LEGACY_EXPIRY
-      ? new Date(process.env.WEBHOOK_LEGACY_EXPIRY).getTime()
-      : Date.now() + 30 * 24 * 60 * 60 * 1000;
-    const legacyAllowed = Date.now() < legacyExpiry;
-    const legacyValid = legacyAllowed && !providedSignature && !!webhookSecret && safeTokenEquals(providedSecret, webhookSecret);
-
-    if (!webhookSecret || (!hmacValid && !legacyValid)) {
-      return res.status(401).json({ ok: false, error: 'WEBHOOK_AUTH_REQUIRED' });
-    }
-
-    if (!dbPool) {
-      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_WEBHOOK' });
+    const unexpectedFields = Array.from(
+      new Set([
+        ...findUnexpectedKeys(req.query, WEBHOOK_ALLOWED_KEYS),
+        ...findUnexpectedKeys(req.body, WEBHOOK_ALLOWED_KEYS),
+      ])
+    );
+    if (unexpectedFields.length > 0) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: '/api/webhook/postback',
+        anomalyCategory: 'SUSPICIOUS_BEHAVIOR',
+        errorCode: 'UNEXPECTED_FIELDS',
+        sourceIp: req.ip,
+        details: { unexpectedFields },
+      });
+      return res.status(400).json({
+        ok: false,
+        error: 'UNEXPECTED_FIELDS',
+        unexpectedFields,
+      });
     }
 
     const statusParam = String(req.query.status || req.body?.status || 'CONFIRMED')
@@ -905,24 +1045,166 @@ export function createExpressApp() {
         req.body?.webhookNonce ||
         ''
     ).trim();
-    const payoutRaw = Number(
-      req.query.payout || req.query.revenue || req.body?.payout || req.body?.revenue || 0
+    const payoutStr = String(
+      req.query.payout ?? req.query.revenue ?? req.body?.payout ?? req.body?.revenue ?? ''
+    ).trim();
+    const payoutRaw = Number(payoutStr || 0);
+
+    const webhookSecret = process.env.WEBHOOK_SECRET || '';
+    const sigHeader = String(req.header('x-webhook-signature') || '').trim();
+    const tsHeader = String(req.header('x-webhook-timestamp') || '').trim();
+    const legacyState = checkLegacyWebhookTransition();
+
+    if (legacyState.hmacStrictlyRequired && req.query.secret && !req.header('x-webhook-secret') && !sigHeader) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: '/api/webhook/postback',
+        providerId: provider || null,
+        userId: Number(userIdRaw) || null,
+        anomalyCategory: 'INVALID_SIGNATURE',
+        errorCode: 'QUERY_SECRET_DISABLED',
+        sourceIp: req.ip,
+      });
+      return res.status(401).json({ ok: false, error: 'QUERY_SECRET_DISABLED' });
+    }
+
+    if (sigHeader || tsHeader || legacyState.hmacStrictlyRequired) {
+      let hmacCheck: { valid: boolean; reason?: string; timestampSeconds?: number };
+      if (req.method === 'GET') {
+        const qIdx = req.originalUrl.indexOf('?');
+        const rawQuery = qIdx >= 0 ? req.originalUrl.slice(qIdx + 1) : '';
+        const rawQueryCheck = verifyWebhookRawBodyHmac({
+          secret: webhookSecret,
+          timestampRaw: tsHeader,
+          signatureRaw: sigHeader,
+          rawBody: Buffer.from(rawQuery, 'utf8'),
+        });
+        if (rawQueryCheck.valid) {
+          hmacCheck = rawQueryCheck;
+        } else {
+          hmacCheck = verifyWebhookHmacSignature({
+            secret: webhookSecret,
+            timestampRaw: tsHeader,
+            signatureRaw: sigHeader,
+            canonicalPayload: buildCanonicalWebhookPayload({
+              provider,
+              txId,
+              userId: userIdRaw,
+              clickId,
+              interactionId,
+              payout: payoutStr,
+              status: statusParam,
+              nonce: webhookNonce,
+            }),
+          });
+        }
+      } else {
+        const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+        hmacCheck = verifyWebhookRawBodyHmac({
+          secret: webhookSecret,
+          timestampRaw: tsHeader,
+          signatureRaw: sigHeader,
+          rawBody,
+        });
+      }
+
+      if (!hmacCheck.valid) {
+        if (!sigHeader && !tsHeader && legacyState.legacyExpired) {
+          return res.status(401).json({
+            ok: false,
+            error: 'LEGACY_WEBHOOK_TRANSITION_EXPIRED',
+            sunsetAt: legacyState.sunsetAtIso,
+          });
+        }
+        const category: InboundAnomalyCategory =
+          hmacCheck.reason === 'WEBHOOK_TIMESTAMP_EXPIRED' ? 'REPLAY_ATTEMPT' : 'INVALID_SIGNATURE';
+        void LedgerService.logInboundSecurityEvent({
+          endpoint: '/api/webhook/postback',
+          providerId: provider || null,
+          userId: Number(userIdRaw) || null,
+          anomalyCategory: category,
+          errorCode: hmacCheck.reason || 'INVALID_WEBHOOK_SIGNATURE',
+          sourceIp: req.ip,
+        });
+        return res.status(401).json({
+          ok: false,
+          error: hmacCheck.reason || 'INVALID_WEBHOOK_SIGNATURE',
+        });
+      }
+    } else {
+      const providedSecret =
+        req.header('x-webhook-secret') || String(req.query.secret || req.body?.secret || '');
+      if (!webhookSecret || !safeTokenEquals(providedSecret, webhookSecret)) {
+        void LedgerService.logInboundSecurityEvent({
+          endpoint: '/api/webhook/postback',
+          providerId: provider || null,
+          userId: Number(userIdRaw) || null,
+          anomalyCategory: 'INVALID_SIGNATURE',
+          errorCode: 'WEBHOOK_AUTH_REQUIRED',
+          sourceIp: req.ip,
+        });
+        return res.status(401).json({ ok: false, error: 'WEBHOOK_AUTH_REQUIRED' });
+      }
+    }
+
+    if (provider && BANNED_PROVIDER_KEYWORDS.some((kw) => provider.includes(kw))) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: '/api/webhook/postback',
+        providerId: provider,
+        userId: Number(userIdRaw) || null,
+        anomalyCategory: 'SUSPICIOUS_BEHAVIOR',
+        errorCode: 'PROVIDER_BANNED_BY_POLICY',
+        sourceIp: req.ip,
+      });
+      return res.status(403).json({ ok: false, error: 'PROVIDER_BANNED_BY_POLICY' });
+    }
+
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_WEBHOOK' });
+    }
+
+    const rl = await LedgerService.consumeProviderRateLimit(
+      provider || req.ip || 'unknown',
+      'webhook_postback',
+      10
     );
+    if (!rl.ok) {
+      return res.status(503).json({
+        ok: false,
+        error: rl.error || 'RATE_LIMIT_DB_UNAVAILABLE',
+        rateLimitMode: rl.mode,
+      });
+    }
+    if (!rl.allowed) {
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: '/api/webhook/postback',
+        providerId: provider || null,
+        userId: Number(userIdRaw) || null,
+        anomalyCategory: 'SUSPICIOUS_BEHAVIOR',
+        errorCode: 'PROVIDER_RATE_LIMIT_EXCEEDED',
+        sourceIp: req.ip,
+        details: { limit: rl.limit, currentCount: rl.currentCount, mode: rl.mode },
+      });
+      return res.status(429).json({
+        ok: false,
+        error: 'PROVIDER_RATE_LIMIT_EXCEEDED',
+        limit: rl.limit,
+        rateLimitMode: rl.mode,
+      });
+    }
 
     if (statusParam === 'REVOKED' || statusParam === 'CHARGEBACK') {
       if (!txId || txId.length < 3) {
         return res.status(400).json({ ok: false, error: 'TX_ID_REQUIRED_FOR_REVOCATION' });
       }
-      const revokeRes = await LedgerService.confirmPartnerReward(txId, 'REVOKED');
-      // Rollback punti (best-effort, non blocca la revoca)
-      try { await LedgerService.revokeRewardWithRollback(txId); } catch { /* ignora */ }
-      if (!revokeRes.success) {
+      const revokeRes = await LedgerService.revokeRewardPostback(txId, 'PARTNER_CHARGEBACK');
+      if (!revokeRes.ok) {
         return res.status(409).json({ ok: false, error: revokeRes.error || 'REVOKE_FAILED' });
       }
       return res.json({
         ok: true,
         eventId: txId,
-        status: 'REVOKED',
+        status: revokeRes.status || 'REVOKED',
+        idempotent: Boolean(revokeRes.idempotent),
       });
     }
 
@@ -944,46 +1226,6 @@ export function createExpressApp() {
     }
 
     const rawPoints = Math.round(payoutRaw * 100);
-
-    // Rate limit per-fornitore (10 req/min per provider)
-    {
-      const now = Date.now();
-      const windowMs = 60 * 1000;
-      const maxPerProvider = 10;
-      const windowStart = new Date(Math.floor(now / windowMs) * windowMs).toISOString();
-      let count = 0;
-      if (dbPool) {
-        try {
-          const r = await dbPool.query(
-            `INSERT INTO core.provider_rate_limit (provider, window_start, request_count)
-             VALUES ($1, $2, 1)
-             ON CONFLICT (provider, window_start)
-             DO UPDATE SET request_count = core.provider_rate_limit.request_count + 1
-             RETURNING request_count`,
-            [provider, windowStart]
-          );
-          count = r.rows[0]?.request_count || 1;
-        } catch {
-          // Fallback in-memory se tabella non esiste
-          const key = `provider:${provider}`;
-          const entry = perProviderRateLimit.get(key) || { count: 0, resetAt: now + windowMs };
-          if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + windowMs; }
-          entry.count += 1;
-          perProviderRateLimit.set(key, entry);
-          count = entry.count;
-        }
-      } else {
-        const key = `provider:${provider}`;
-        const entry = perProviderRateLimit.get(key) || { count: 0, resetAt: now + windowMs };
-        if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + windowMs; }
-        entry.count += 1;
-        perProviderRateLimit.set(key, entry);
-        count = entry.count;
-      }
-      if (count > maxPerProvider) {
-        return res.status(429).json({ ok: false, error: 'PROVIDER_RATE_LIMIT_EXCEEDED' });
-      }
-    }
     const ledgerRes = await LedgerService.recordVerifiedInteractionPostback({
       eventId: txId,
       partnerId: provider,
@@ -1004,20 +1246,42 @@ export function createExpressApp() {
     });
 
     if (!ledgerRes.success) {
+      const errCode = ledgerRes.error || 'WEBHOOK_LEDGER_ERROR';
+      const category: InboundAnomalyCategory =
+        errCode === 'WEBHOOK_NONCE_REPLAYED' || errCode === 'EVENT_ID_REPLAY_CONFLICT'
+          ? 'REPLAY_ATTEMPT'
+          : errCode === 'INTERACTION_OWNERSHIP_MISMATCH' ||
+            errCode === 'INTERACTION_CLICK_MISMATCH' ||
+            errCode === 'AUTO_SESSION_REVOKED_OR_EXPIRED' ||
+            errCode === 'PROVIDER_BLOCKED_BY_REPUTATION'
+          ? 'SUSPICIOUS_BEHAVIOR'
+          : 'TECHNICAL_ERROR';
+
+      void LedgerService.logInboundSecurityEvent({
+        endpoint: '/api/webhook/postback',
+        providerId: provider,
+        userId: numericUserId,
+        anomalyCategory: category,
+        errorCode: errCode,
+        sourceIp: req.ip,
+        details: { txId, clickId: clickId || null, interactionId: interactionId || null },
+      });
+
       const code =
-        ledgerRes.error === 'WEBHOOK_NONCE_REPLAYED' ||
-        ledgerRes.error === 'EVENT_ID_REPLAY_CONFLICT'
+        errCode === 'WEBHOOK_NONCE_REPLAYED' || errCode === 'EVENT_ID_REPLAY_CONFLICT'
           ? 409
-          : ledgerRes.error === 'INTERACTION_NOT_FOUND' ||
-            ledgerRes.error === 'INTERACTION_EXPIRED' ||
-            ledgerRes.error === 'PROVIDER_NOT_REGISTERED'
+          : errCode === 'INTERACTION_NOT_FOUND' ||
+            errCode === 'INTERACTION_EXPIRED' ||
+            errCode === 'PROVIDER_NOT_REGISTERED'
           ? 404
-          : ledgerRes.error === 'USER_BLOCKED' ||
-            ledgerRes.error === 'PROVIDER_BLOCKED_BY_REPUTATION' ||
-            ledgerRes.error === 'PROVIDER_EXPOSURE_BLOCKED'
+          : errCode === 'USER_BLOCKED' ||
+            errCode === 'AUTO_SESSION_REVOKED_OR_EXPIRED' ||
+            errCode === 'PROVIDER_BLOCKED_BY_REPUTATION' ||
+            errCode === 'PROVIDER_EXPOSURE_BLOCKED' ||
+            String(errCode).includes('GLOBAL_PARTNER_EXPOSURE_LIMIT_EXCEEDED')
           ? 403
           : 409;
-      return res.status(code).json({ ok: false, error: ledgerRes.error || 'WEBHOOK_LEDGER_ERROR' });
+      return res.status(code).json({ ok: false, error: errCode });
     }
 
     return res.json({
@@ -1055,10 +1319,17 @@ export function createExpressApp() {
         actualNetReceivedUsd = 0,
         haircutRatio = 1.0,
         onchainTxHash = '',
+        receivedAsset = 'USDT',
       } = req.body || {};
 
       if (!batchId || !partnerId || !onchainTxHash) {
         return res.status(400).json({ ok: false, error: 'batchId, partnerId e onchainTxHash richiesti' });
+      }
+
+      const normalizedReceivedAsset = String(receivedAsset || 'USDT').trim().toUpperCase();
+      const VALID_ASSETS = new Set(['TON', 'SOL', 'PI', 'USDT', 'USDC', 'CASH_AIRTM', 'CASH_PAYEER', 'CASH_VOLET']);
+      if (!VALID_ASSETS.has(normalizedReceivedAsset)) {
+        return res.status(400).json({ ok: false, error: 'UNSUPPORTED_SETTLEMENT_ASSET' });
       }
 
       const result = await SettlementService.executeBatchSettlement({
@@ -1070,6 +1341,7 @@ export function createExpressApp() {
         actualNetReceivedUsd: Number(actualNetReceivedUsd),
         haircutRatio: Number(haircutRatio),
         onchainTxHash: String(onchainTxHash),
+        receivedAsset: normalizedReceivedAsset,
       });
 
       if (!result.success) {
@@ -1142,29 +1414,34 @@ export function createExpressApp() {
   // ============================================================================
   // RICHIESTA PRELIEVO ATOMICA (PostgreSQL WITHDRAWABLE -> RESERVED + FX LIVE)
   // ============================================================================
+  app.post('/api/payout/idempotency-key', financialLimiter, (req: Request, res: Response) => {
+    const authUser = requireTelegramUser(req, res);
+    if (!authUser) return;
+    return res.json({
+      ok: true,
+      idempotencyKey: crypto.randomUUID(),
+      generatedBy: 'SERVER',
+      userId: authUser.userId,
+    });
+  });
+
   app.post('/api/payout/request', financialLimiter, async (req: Request, res: Response) => {
     const authUser = requireTelegramUser(req, res);
     if (!authUser) return;
-
-    // Kill switch globale payout
-    if (process.env.PAYOUTS_DISABLED === 'true') {
-      return res.status(503).json({ ok: false, error: 'PAYOUTS_DISABLED_BY_KILL_SWITCH' });
-    }
-    if (dbPool) {
-      try {
-        const ks = await dbPool.query(`SELECT enabled FROM core.kill_switch WHERE key = 'PAYOUTS_DISABLED'`);
-        if (ks.rows[0]?.enabled === true) {
-          return res.status(503).json({ ok: false, error: 'PAYOUTS_DISABLED_BY_KILL_SWITCH' });
-        }
-      } catch {
-        // tabella non esiste → ignora
-      }
-    }
 
     if (!dbPool) {
       return res.status(503).json({
         ok: false,
         error: 'POSTGRES_REQUIRED_FOR_PAYOUT',
+      });
+    }
+
+    const killSwitch = await LedgerService.getKillSwitchStatus();
+    if (killSwitch.is_enabled) {
+      return res.status(423).json({
+        ok: false,
+        error: 'PAYOUT_KILL_SWITCH_ACTIVE',
+        killSwitch,
       });
     }
 
@@ -1232,6 +1509,15 @@ export function createExpressApp() {
       });
     }
 
+    const rawIdemKey = String(req.body?.idempotencyKey || req.header('x-idempotency-key') || '').trim();
+    if (rawIdemKey.length > 0 && rawIdemKey.length < 4) {
+      return res.status(400).json({
+        ok: false,
+        error: 'INVALID_IDEMPOTENCY_KEY',
+      });
+    }
+    const idemKey = rawIdemKey.length >= 4 ? rawIdemKey.slice(0, 128) : crypto.randomUUID();
+
     // Se il prelievo è in asset volatile (TON/SOL/PI), aggiorniamo/verifichiamo la quota live per lo specifico asset
     if (cryptoAsset === 'TON' || cryptoAsset === 'SOL' || cryptoAsset === 'PI') {
       const fx = await refreshAndGetFxQuote();
@@ -1250,54 +1536,7 @@ export function createExpressApp() {
       }
     }
 
-    const payloadFingerprint = crypto
-      .createHash('sha256')
-      .update(JSON.stringify({ uid, numericPoints, cryptoAsset, cleanAddress }))
-      .digest('hex');
-    const clientRequestId = String(req.body?.requestId || req.header('x-request-id') || '').trim();
-
-    // Idempotenza persistente: cerca payout esistente con stesso fingerprint
-    if (dbPool) {
-      try {
-        const existing = await dbPool.query(
-          `SELECT request_id, idempotency_key FROM core.payout_requests
-           WHERE user_id = $1 AND request_fingerprint = $2
-           ORDER BY created_at DESC LIMIT 1`,
-          [uid, payloadFingerprint]
-        );
-        if (existing.rows.length > 0) {
-          const row = existing.rows[0];
-          return res.json({
-            ok: true,
-            idempotent: true,
-            payout: { request_id: row.request_id, idempotency_key: row.idempotency_key },
-            message: 'Payout esistente restituito (idempotenza persistente).',
-          });
-        }
-      } catch {
-        // colonna non esiste → ignora (migrazione non applicata)
-      }
-    }
-    let idemKey: string;
-    if (clientRequestId.length >= 8) {
-      const stored = payoutIdempotencyFingerprints.get(clientRequestId);
-      if (stored) {
-        const [storedUid, storedFp] = stored.split(':');
-        if (storedUid !== String(uid)) {
-          return res.status(403).json({ ok: false, error: 'IDEMPOTENCY_KEY_USER_MISMATCH' });
-        }
-        if (storedFp !== payloadFingerprint) {
-          return res.status(409).json({ ok: false, error: 'IDEMPOTENCY_KEY_PAYLOAD_MISMATCH' });
-        }
-      }
-      payoutIdempotencyFingerprints.set(clientRequestId, `${uid}:${payloadFingerprint}`);
-      idemKey = clientRequestId;
-    } else {
-      idemKey = crypto.randomUUID();
-      payoutIdempotencyFingerprints.set(idemKey, `${uid}:${payloadFingerprint}`);
-    }
-
-    const reqId = `payout_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const reqId = `payout_${crypto.randomUUID()}`;
     const result = await LedgerService.requestPayout({
       requestId: reqId,
       userId: uid,
@@ -1362,11 +1601,28 @@ export function createExpressApp() {
 
     const reqId = String(requestId).trim();
     const targetStatus = String(status).toUpperCase();
+    const adminActor = resolveAdminActor(req);
+
+    if (targetStatus === 'APPROVED' || targetStatus === 'COMPLETED') {
+      const killSwitch = await LedgerService.getKillSwitchStatus();
+      if (killSwitch.is_enabled) {
+        return res.status(423).json({
+          ok: false,
+          error: 'PAYOUT_KILL_SWITCH_ACTIVE',
+          killSwitch,
+        });
+      }
+    }
 
     if (targetStatus === 'APPROVED') {
-      const r = await LedgerService.approvePayout(reqId, 'admin', note ? String(note) : undefined);
+      const r = await LedgerService.approvePayout(reqId, adminActor, note ? String(note) : undefined);
       if (!r.ok) return res.status(409).json({ ok: false, error: r.error });
-      return res.json({ ok: true, idempotent: Boolean((r as any).idempotent), payout: r.payout });
+      return res.json({
+        ok: true,
+        idempotent: Boolean(r.idempotent),
+        requiresSecondApproval: Boolean(r.requires_second_approval),
+        payout: r.payout,
+      });
     }
 
     if (targetStatus === 'COMPLETED') {
@@ -1377,9 +1633,62 @@ export function createExpressApp() {
           error: 'REAL_VERIFIABLE_TX_HASH_REQUIRED',
         });
       }
+      const payout = await LedgerService.getPayoutById(reqId);
+      if (!payout) {
+        return res.status(404).json({ ok: false, error: 'PAYOUT_NOT_FOUND' });
+      }
+      const payoutAsset = String(payout.crypto_asset || 'TON');
+      const payoutDest = String(payout.wallet_address || '');
+      const verifierGuard = canVerifyPayoutAssetIndependently(payoutAsset, payoutDest);
+      if (!verifierGuard.verifiable) {
+        return res.status(409).json({
+          ok: false,
+          error: verifierGuard.reason || 'INDEPENDENT_VERIFIER_UNAVAILABLE',
+          asset: payoutAsset,
+        });
+      }
+      const onchainCheck = await verifyPayoutTransactionOnChain({
+        asset: payoutAsset,
+        txHash: cleanTxHash,
+        destinationAddress: payoutDest,
+        expectedAmountAsset: Number(payout.asset_amount || payout.amount_ton || 0),
+        expectedAmountUsd: Number(payout.amount_usd || 0),
+      });
+      if (!onchainCheck.verified) {
+        return res.status(409).json({
+          ok: false,
+          error: onchainCheck.reason || 'ONCHAIN_TX_VERIFICATION_FAILED',
+          verification: onchainCheck,
+        });
+      }
+      const proofSave = await LedgerService.recordPayoutOnchainVerification({
+        requestId: reqId,
+        asset: String(payout.crypto_asset || 'TON'),
+        network: onchainCheck.network,
+        txHash: cleanTxHash,
+        destinationAddress: String(payout.wallet_address || ''),
+        expectedAmountAsset: Number(payout.asset_amount || payout.amount_ton || 0),
+        observedAmountAsset: onchainCheck.observedAmountAsset ?? null,
+        confirmations: onchainCheck.confirmations ?? null,
+        commitmentLevel: onchainCheck.commitmentLevel ?? null,
+        verified: true,
+        verifiedBy: `admin:${adminActor}`,
+        rawProof: onchainCheck.rawProof || {},
+      });
+      if (!proofSave.ok) {
+        return res.status(409).json({
+          ok: false,
+          error: proofSave.error || 'ONCHAIN_PROOF_RECORD_FAILED',
+        });
+      }
       const r = await LedgerService.completePayout(reqId, cleanTxHash, note ? String(note) : undefined);
       if (!r.ok) return res.status(409).json({ ok: false, error: r.error });
-      return res.json({ ok: true, idempotent: r.idempotent, payout: r.payout });
+      return res.json({
+        ok: true,
+        idempotent: r.idempotent,
+        payout: r.payout,
+        verification: onchainCheck,
+      });
     }
 
     if (targetStatus === 'REJECTED') {
@@ -1395,6 +1704,10 @@ export function createExpressApp() {
     if (!dbPool) {
       return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_PAYOUT' });
     }
+    const killSwitch = await LedgerService.getKillSwitchStatus();
+    if (killSwitch.is_enabled) {
+      return res.status(423).json({ ok: false, error: 'PAYOUT_KILL_SWITCH_ACTIVE', killSwitch });
+    }
     const dispatchRes = await workers.tonPayout.processApprovedTonPayouts();
     if (!dispatchRes.ok) {
       const code = dispatchRes.error === 'TON_PAYOUT_WALLET_NOT_CONFIGURED' ? 503 : 409;
@@ -1406,6 +1719,10 @@ export function createExpressApp() {
   app.post('/api/payout/process-all', adminLimiter, requireAdmin, async (_req: Request, res: Response) => {
     if (!dbPool) {
       return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_PAYOUT' });
+    }
+    const killSwitch = await LedgerService.getKillSwitchStatus();
+    if (killSwitch.is_enabled) {
+      return res.status(423).json({ ok: false, error: 'PAYOUT_KILL_SWITCH_ACTIVE', killSwitch });
     }
     const dispatchRes = await workers.multiAssetPayout.processApprovedPayouts();
     if (!dispatchRes.ok) {
@@ -1422,6 +1739,135 @@ export function createExpressApp() {
     });
   });
 
+  app.post('/api/payout/reconcile-uncertain', adminLimiter, requireAdmin, async (_req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_PAYOUT' });
+    }
+    const result = await workers.multiAssetPayout.reconcileUncertainPayouts();
+    return res.status(result.ok ? 200 : 409).json(result);
+  });
+
+  // ============================================================================
+  // SICUREZZA GLOBALE: KILL SWITCH, TESORERIA PER-ASSET & STORNO PAYOUT (SOLO ADMIN)
+  // ============================================================================
+  app.get('/api/admin/kill-switch', adminLimiter, requireAdmin, async (_req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_KILL_SWITCH' });
+    }
+    const status = await LedgerService.getKillSwitchStatus();
+    return res.json({ ok: true, killSwitch: status });
+  });
+
+  app.post('/api/admin/kill-switch', adminLimiter, requireAdmin, async (req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_KILL_SWITCH' });
+    }
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'BOOLEAN_ENABLED_REQUIRED' });
+    }
+    const actor = resolveAdminActor(req);
+    const reason = req.body?.reason ? String(req.body.reason).slice(0, 200) : undefined;
+    const result = await LedgerService.setKillSwitchStatus(req.body.enabled, reason, actor);
+    if (!result.ok) {
+      return res.status(409).json({ ok: false, error: result.error || 'KILL_SWITCH_UPDATE_FAILED' });
+    }
+    return res.json({ ok: true, killSwitch: result });
+  });
+
+  app.get('/api/admin/treasury-status', adminLimiter, requireAdmin, async (_req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_TREASURY' });
+    }
+    const [solvency, assets, killSwitch, limits] = await Promise.all([
+      SettlementService.getTreasurySolvencyStatus(),
+      SettlementService.getTreasuryAssetBreakdown(),
+      LedgerService.getKillSwitchStatus(),
+      LedgerService.getFinancialLimits(),
+    ]);
+    return res.json({
+      ok: true,
+      payoutExecutionMode: workers.multiAssetPayout.getStatus().payoutExecutionMode,
+      serverKeyCustodyDisabled: workers.multiAssetPayout.getStatus().serverKeyCustodyDisabled,
+      solvency,
+      assets,
+      killSwitch,
+      limits,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.post('/api/admin/treasury-convert', adminLimiter, requireAdmin, async (req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_TREASURY' });
+    }
+    const { fromAsset, toAsset, amountUsd, fxRate = 1.0, externalTxRef, note } = req.body || {};
+    const numUsd = Number(amountUsd || 0);
+    if (!fromAsset || !toAsset || !Number.isFinite(numUsd) || numUsd <= 0) {
+      return res.status(400).json({ ok: false, error: 'fromAsset, toAsset e amountUsd (>0) obbligatori' });
+    }
+    const cleanTxRef = String(externalTxRef || '').trim();
+    if (isObviouslyFakeTxReference(cleanTxRef, 8)) {
+      return res.status(400).json({ ok: false, error: 'CONVERSION_EXTERNAL_TX_REF_REQUIRED' });
+    }
+    const result = await LedgerService.recordTreasuryConversion({
+      conversionId: `conv_${crypto.randomUUID()}`,
+      fromAsset: String(fromAsset).trim().toUpperCase(),
+      toAsset: String(toAsset).trim().toUpperCase(),
+      amountUsd: numUsd,
+      fxRate: Number(fxRate || 1.0),
+      externalTxRef: cleanTxRef,
+      recordedBy: resolveAdminActor(req),
+      note: note ? String(note).slice(0, 200) : undefined,
+    });
+    if (!result.ok) {
+      return res.status(409).json(result);
+    }
+    return res.json(result);
+  });
+
+  app.post('/api/admin/payout/reverse', adminLimiter, requireAdmin, async (req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_PAYOUT' });
+    }
+    const requestId = String(req.body?.requestId || '').trim();
+    const reason = String(req.body?.reason || 'PAYOUT_DISPUTED').trim().slice(0, 200);
+    if (!requestId) {
+      return res.status(400).json({ ok: false, error: 'requestId richiesto' });
+    }
+    const result = await LedgerService.reverseCompletedPayout(requestId, reason, resolveAdminActor(req));
+    if (!result.ok) {
+      return res.status(409).json(result);
+    }
+    return res.json(result);
+  });
+
+  app.post('/api/admin/auto-session/revoke', adminLimiter, requireAdmin, async (req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_AUTO_SESSION' });
+    }
+    const sessionId = String(req.body?.sessionId || '').trim();
+    const reason = String(req.body?.reason || 'ADMIN_REVOKED').trim().slice(0, 200);
+    if (!sessionId || sessionId.length < 8) {
+      return res.status(400).json({ ok: false, error: 'VALID_SESSION_ID_REQUIRED' });
+    }
+    const result = await LedgerService.revokeAutoSession(sessionId, reason, resolveAdminActor(req));
+    if (!result.ok) {
+      const code = result.error === 'SESSION_NOT_FOUND' ? 404 : 409;
+      return res.status(code).json(result);
+    }
+    return res.json(result);
+  });
+
+  app.get('/api/admin/security/inbound-logs', adminLimiter, requireAdmin, async (req: Request, res: Response) => {
+    if (!dbPool) {
+      return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_SECURITY_LOGS' });
+    }
+    const limit = Number(req.query.limit || 50);
+    const category = typeof req.query.category === 'string' ? req.query.category : undefined;
+    const logs = await LedgerService.getInboundSecurityLogs(limit, category);
+    return res.json({ ok: true, count: logs.length, logs });
+  });
+
   // ============================================================================
   // PROVIDER REPUTATION ADMIN ROUTES & WALLET CONFIG
   // ============================================================================
@@ -1431,6 +1877,7 @@ export function createExpressApp() {
     res.json({
       ok: true,
       payoutMode: workers.tonPayout.getMetrics().mode,
+      payoutExecutionMode: workers.multiAssetPayout.getStatus().payoutExecutionMode,
       wallets: {
         TON: {
           receiveAddress: WALLET_CONFIG.TON.receiveAddress,
@@ -1454,6 +1901,54 @@ export function createExpressApp() {
   return app;
 }
 
+function resolveServerPort(): number {
+  for (let i = 0; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg === '--port' && process.argv[i + 1]) {
+      const parsed = Number(process.argv[i + 1]);
+      if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
+    } else if (arg.startsWith('--port=')) {
+      const parsed = Number(arg.slice('--port='.length));
+      if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
+    }
+  }
+
+  const envPort = Number(process.env.PORT);
+  const nginxPort = Number(process.env.NGINX_PORT);
+  const defaultAppPort = Number(process.env.DEFAULT_APP_PORT);
+
+  if (
+    Number.isInteger(envPort) &&
+    envPort > 0 &&
+    Number.isInteger(nginxPort) &&
+    nginxPort > 0 &&
+    envPort === nginxPort &&
+    Number.isInteger(defaultAppPort) &&
+    defaultAppPort > 0 &&
+    defaultAppPort !== nginxPort
+  ) {
+    return defaultAppPort;
+  }
+
+  if (Number.isInteger(envPort) && envPort > 0 && envPort <= 65535) return envPort;
+  if (Number.isInteger(defaultAppPort) && defaultAppPort > 0 && defaultAppPort <= 65535) {
+    return defaultAppPort;
+  }
+  return 3000;
+}
+
+function resolveServerHost(): string {
+  for (let i = 0; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg === '--host' && process.argv[i + 1]) {
+      return process.argv[i + 1];
+    } else if (arg.startsWith('--host=')) {
+      return arg.slice('--host='.length) || '0.0.0.0';
+    }
+  }
+  return '0.0.0.0';
+}
+
 let serverStarted = false;
 
 export async function startServer() {
@@ -1464,7 +1959,8 @@ export async function startServer() {
     await LedgerService.loadCountryEconomicProfilesFromDb().catch(() => {});
   }
   const app = createExpressApp();
-  const PORT = Number(process.env.PORT) || 3000;
+  const PORT = resolveServerPort();
+  const HOST = resolveServerHost();
 
   workers.tonPayout.start();
   workers.settlement.start();
@@ -1484,9 +1980,13 @@ export async function startServer() {
   wbSyncTimer.unref();
 
   if (process.env.NODE_ENV !== 'production') {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ...(disableHmr ? { hmr: false, ws: false } : {}),
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1498,8 +1998,14 @@ export async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ActionFlow Hub Server listening on http://0.0.0.0:${PORT}`);
+  await new Promise<void>((resolve, reject) => {
+    const server = app.listen(PORT, HOST, () => {
+      console.log(`ActionFlow Hub Server listening on http://${HOST}:${PORT}`);
+      resolve();
+    });
+    server.on('error', (err) => {
+      reject(err);
+    });
   });
 }
 

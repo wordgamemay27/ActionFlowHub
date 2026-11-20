@@ -30,6 +30,7 @@ import {
   listCountryEconomicProfiles,
   type CountryEconomicProfile,
 } from '../lib/geoEconomics';
+import { isObviouslyFakeTxReference } from '../lib/txRefValidation';
 
 interface DbPayoutRow {
   request_id: string;
@@ -86,9 +87,19 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [batchNetUsd, setBatchNetUsd] = useState<string>('');
   const [batchHaircut, setBatchHaircut] = useState<string>('1.0');
   const [batchTxHash, setBatchTxHash] = useState<string>('');
+  const [batchReceivedAsset, setBatchReceivedAsset] = useState<string>('USDT');
   const [executingBatch, setExecutingBatch] = useState<boolean>(false);
   const [processingMultiAsset, setProcessingMultiAsset] = useState<boolean>(false);
   const [syncingWorldBank, setSyncingWorldBank] = useState<boolean>(false);
+  const [adminOperatorId, setAdminOperatorId] = useState<string>('');
+  const [treasuryStatus, setTreasuryStatus] = useState<any>(null);
+  const [loadingTreasury, setLoadingTreasury] = useState<boolean>(false);
+  const [togglingKillSwitch, setTogglingKillSwitch] = useState<boolean>(false);
+  const [killSwitchReason, setKillSwitchReason] = useState<string>('');
+  const [convFromAsset, setConvFromAsset] = useState<string>('USDT');
+  const [convToAsset, setConvToAsset] = useState<string>('TON');
+  const [convAmountUsd, setConvAmountUsd] = useState<string>('');
+  const [convTxRef, setConvTxRef] = useState<string>('');
   const [worldBankProfiles, setWorldBankProfiles] = useState<CountryEconomicProfile[]>(() =>
     listCountryEconomicProfiles()
   );
@@ -226,6 +237,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
           actualNetReceivedUsd,
           haircutRatio,
           onchainTxHash: batchTxHash.trim(),
+          receivedAsset: batchReceivedAsset,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -234,14 +246,124 @@ export const AdminView: React.FC<AdminViewProps> = ({
         return;
       }
       setAdminStatusMsg(
-        `Batch ${batchId.trim()} eseguito su PostgreSQL ($${actualNetReceivedUsd.toFixed(2)} netti, tx ${batchTxHash.trim().slice(0, 12)}...).`
+        `Batch ${batchId.trim()} eseguito (${batchReceivedAsset}) su PostgreSQL: $${actualNetReceivedUsd.toFixed(2)} netti, tx ${batchTxHash.trim().slice(0, 12)}...`
       );
       setBatchId('');
       setBatchTxHash('');
+      void loadTreasuryStatus();
     } catch {
       setAdminError('Errore di rete durante POST /api/settlement/execute.');
     } finally {
       setExecutingBatch(false);
+    }
+  };
+
+  const loadTreasuryStatus = async () => {
+    if (!adminToken.trim()) {
+      setAdminError('Inserisci X-Admin-Token per leggere stato Tesoreria & Kill Switch.');
+      return;
+    }
+    setLoadingTreasury(true);
+    setAdminError(null);
+    try {
+      const res = await fetch('/api/admin/treasury-status', {
+        headers: { 'X-Admin-Token': adminToken.trim() },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok) {
+        setAdminError(data?.error || `Errore lettura Tesoreria (${res.status})`);
+        return;
+      }
+      setTreasuryStatus(data);
+    } catch {
+      setAdminError('Errore di rete durante GET /api/admin/treasury-status.');
+    } finally {
+      setLoadingTreasury(false);
+    }
+  };
+
+  const handleToggleKillSwitch = async (enable: boolean) => {
+    if (!adminToken.trim()) {
+      setAdminError('Inserisci X-Admin-Token per modificare il Kill Switch globale.');
+      return;
+    }
+    setTogglingKillSwitch(true);
+    setAdminError(null);
+    setAdminStatusMsg(null);
+    try {
+      const res = await fetch('/api/admin/kill-switch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Token': adminToken.trim(),
+          ...(adminOperatorId.trim() ? { 'X-Admin-Id': adminOperatorId.trim() } : {}),
+        },
+        body: JSON.stringify({
+          enabled: enable,
+          reason: killSwitchReason.trim() || (enable ? 'MANUAL_EMERGENCY_STOP' : 'ADMIN_RESUME'),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok) {
+        setAdminError(data?.error || `Errore Kill Switch (${res.status})`);
+        return;
+      }
+      setAdminStatusMsg(
+        enable
+          ? 'KILL SWITCH ATTIVO: nuovi prelievi, approvazioni e pagamenti bloccati.'
+          : 'Kill Switch disattivato: pagamenti ripristinati secondo soglie e copertura.'
+      );
+      void loadTreasuryStatus();
+    } catch {
+      setAdminError('Errore di rete durante POST /api/admin/kill-switch.');
+    } finally {
+      setTogglingKillSwitch(false);
+    }
+  };
+
+  const handleTreasuryConvert = async () => {
+    if (!adminToken.trim()) {
+      setAdminError('Inserisci X-Admin-Token per registrare una conversione Tesoreria.');
+      return;
+    }
+    const amt = Number(convAmountUsd || 0);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      setAdminError('Inserisci un importo USD (>0) valido per la conversione.');
+      return;
+    }
+    const cleanRef = convTxRef.trim();
+    if (isObviouslyFakeTxReference(cleanRef, 8)) {
+      setAdminError('Ref Swap / Tx Hash reale obbligatorio (minimo 8 caratteri, nessun prefisso test/fake).');
+      return;
+    }
+    setAdminError(null);
+    setAdminStatusMsg(null);
+    try {
+      const res = await fetch('/api/admin/treasury-convert', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Token': adminToken.trim(),
+          ...(adminOperatorId.trim() ? { 'X-Admin-Id': adminOperatorId.trim() } : {}),
+        },
+        body: JSON.stringify({
+          fromAsset: convFromAsset,
+          toAsset: convToAsset,
+          amountUsd: amt,
+          externalTxRef: cleanRef,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok) {
+        setAdminError(data?.error || `Errore conversione (${res.status})`);
+        return;
+      }
+      setAdminStatusMsg(`Conversione registrata: $${amt.toFixed(2)} da ${convFromAsset} a ${convToAsset}.`);
+      setConvAmountUsd('');
+      setConvTxRef('');
+      void loadTreasuryStatus();
+    } catch {
+      setAdminError('Errore di rete durante POST /api/admin/treasury-convert.');
     }
   };
 
@@ -345,6 +467,45 @@ export const AdminView: React.FC<AdminViewProps> = ({
       );
       return;
     }
+    if (adminToken.trim()) {
+      try {
+        const res = await fetch('/api/payout/disburse', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Admin-Token': adminToken.trim(),
+            ...(adminOperatorId.trim() ? { 'X-Admin-Id': adminOperatorId.trim() } : {}),
+          },
+          body: JSON.stringify({
+            requestId,
+            status,
+            txHash: status === 'COMPLETED' ? enteredHash : undefined,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data?.ok) {
+          setAdminError(data?.error || `Operazione rifiutata (${res.status})`);
+          return;
+        }
+        const verifiedActor =
+          data.payout?.second_approved_by ||
+          data.payout?.first_approved_by ||
+          adminOperatorId.trim() ||
+          'token_operator';
+        setAdminStatusMsg(
+          data.requiresSecondApproval
+            ? `Prima approvazione registrata da ${verifiedActor}. Richiesta seconda approvazione da operatore con token distinto (>= $50).`
+            : `Payout ${requestId} aggiornato a ${status}.`
+        );
+        void loadDbPayouts();
+        void loadTreasuryStatus();
+        return;
+      } catch {
+        setAdminError('Errore di rete durante POST /api/payout/disburse.');
+        return;
+      }
+    }
+    if (!onUpdateTransactionStatus) return;
     const result = await onUpdateTransactionStatus(
       requestId,
       status,
@@ -663,14 +824,147 @@ export const AdminView: React.FC<AdminViewProps> = ({
             </div>
 
             {onAdminTokenChange && (
-              <input
-                type="password"
-                value={adminToken}
-                onChange={(e) => onAdminTokenChange(e.target.value)}
-                placeholder="Inserisci X-Admin-Token per autorizzare le operazioni"
-                className="w-full rounded-xl bg-[#050b16] border border-sky-400/25 px-3 py-2 text-xs font-mono text-white placeholder:text-slate-500 focus:outline-none focus:border-sky-400"
-              />
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <input
+                  type="password"
+                  value={adminToken}
+                  onChange={(e) => onAdminTokenChange(e.target.value)}
+                  placeholder="Inserisci X-Admin-Token per autorizzare le operazioni"
+                  className="sm:col-span-2 rounded-xl bg-[#050b16] border border-sky-400/25 px-3 py-2 text-xs font-mono text-white placeholder:text-slate-500 focus:outline-none focus:border-sky-400"
+                />
+                <input
+                  type="text"
+                  value={adminOperatorId}
+                  onChange={(e) => setAdminOperatorId(e.target.value)}
+                  placeholder="ID Operatore (opz., verificato su token)"
+                  className="rounded-xl bg-[#050b16] border border-sky-400/25 px-3 py-2 text-xs font-mono text-white placeholder:text-slate-500 focus:outline-none focus:border-sky-400"
+                />
+              </div>
             )}
+
+            {/* KILL SWITCH & TESORERIA MULTI-ASSET */}
+            <div className="rounded-xl bg-[#050b16] border border-rose-400/25 p-3 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[11px] font-mono font-black uppercase tracking-wider text-rose-300">
+                  Kill Switch & Tesoreria Per-Asset ({treasuryStatus?.payoutExecutionMode || 'MANUAL_EXTERNAL'})
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={loadingTreasury}
+                    onClick={() => void loadTreasuryStatus()}
+                    className="px-2.5 py-1 rounded-lg bg-sky-500/20 hover:bg-sky-500/35 border border-sky-400/40 text-[10px] font-mono font-black text-sky-200 cursor-pointer disabled:opacity-50"
+                  >
+                    {loadingTreasury ? 'Caricamento...' : 'Stato Tesoreria'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={togglingKillSwitch}
+                    onClick={() => void handleToggleKillSwitch(true)}
+                    className="px-2.5 py-1 rounded-lg bg-rose-500/25 hover:bg-rose-500/40 border border-rose-400/50 text-[10px] font-mono font-black text-rose-200 cursor-pointer disabled:opacity-50"
+                  >
+                    Attiva Kill Switch
+                  </button>
+                  <button
+                    type="button"
+                    disabled={togglingKillSwitch}
+                    onClick={() => void handleToggleKillSwitch(false)}
+                    className="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/40 text-[10px] font-mono font-black text-emerald-200 cursor-pointer disabled:opacity-50"
+                  >
+                    Riattiva
+                  </button>
+                </div>
+              </div>
+
+              <input
+                type="text"
+                value={killSwitchReason}
+                onChange={(e) => setKillSwitchReason(e.target.value)}
+                placeholder="Motivo attivazione/disattivazione Kill Switch (opzionale)"
+                className="w-full rounded-lg bg-[#091224] border border-white/15 px-2.5 py-1.5 text-xs font-mono text-white placeholder:text-slate-500"
+              />
+
+              {treasuryStatus && (
+                <div className="space-y-2">
+                  <div className="text-[10px] font-mono text-slate-300 flex flex-wrap items-center gap-3">
+                    <span>
+                      Kill Switch:{' '}
+                      <strong className={treasuryStatus.killSwitch?.is_enabled ? 'text-rose-400' : 'text-emerald-300'}>
+                        {treasuryStatus.killSwitch?.is_enabled ? 'ATTIVO (BLOCCATO)' : 'DISATTIVO (OPERATIVO)'}
+                      </strong>
+                    </span>
+                    <span>
+                      Modalità: <strong className="text-sky-300">{treasuryStatus.payoutExecutionMode}</strong>
+                    </span>
+                    <span>
+                      Max Singolo: <strong>{Number(treasuryStatus.limits?.max_single_payout_points || 10000)} PT</strong>
+                    </span>
+                  </div>
+
+                  {Array.isArray(treasuryStatus.assets) && treasuryStatus.assets.length > 0 && (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                      {treasuryStatus.assets.map((row: any) => (
+                        <div
+                          key={row.asset}
+                          className="rounded-lg bg-[#091224] border border-white/10 p-2 text-[10px] font-mono"
+                        >
+                          <div className="font-black text-white">{row.asset}</div>
+                          <div className="text-emerald-300">
+                            Netto: {Number(row.net_withdrawable_points || 0)} PT
+                          </div>
+                          <div className="text-slate-400">
+                            Cap ${Number(row.actual_cash_on_chain || 0).toFixed(2)} • Pagato ${Number(row.disbursed_usd || 0).toFixed(2)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 pt-1">
+                    <select
+                      value={convFromAsset}
+                      onChange={(e) => setConvFromAsset(e.target.value)}
+                      className="rounded-lg bg-[#091224] border border-white/15 px-2 py-1 text-[11px] font-mono text-white"
+                    >
+                      {['USDT', 'USDC', 'TON', 'SOL', 'PI', 'CASH_AIRTM', 'CASH_PAYEER', 'CASH_VOLET'].map((a) => (
+                        <option key={a} value={a}>Da: {a}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={convToAsset}
+                      onChange={(e) => setConvToAsset(e.target.value)}
+                      className="rounded-lg bg-[#091224] border border-white/15 px-2 py-1 text-[11px] font-mono text-white"
+                    >
+                      {['TON', 'SOL', 'PI', 'USDT', 'USDC', 'CASH_AIRTM', 'CASH_PAYEER', 'CASH_VOLET'].map((a) => (
+                        <option key={a} value={a}>A: {a}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={convAmountUsd}
+                      onChange={(e) => setConvAmountUsd(e.target.value)}
+                      placeholder="USD"
+                      className="rounded-lg bg-[#091224] border border-white/15 px-2 py-1 text-[11px] font-mono text-white"
+                    />
+                    <input
+                      type="text"
+                      value={convTxRef}
+                      onChange={(e) => setConvTxRef(e.target.value)}
+                      placeholder="Ref Swap / Tx Hash (obblig.)"
+                      className="rounded-lg bg-[#091224] border border-white/15 px-2 py-1 text-[11px] font-mono text-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void handleTreasuryConvert()}
+                      className="rounded-lg bg-indigo-500/25 hover:bg-indigo-500/40 border border-indigo-400/45 text-[10px] font-mono font-black text-indigo-200 uppercase cursor-pointer"
+                    >
+                      Converti Cassa
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
 
             {/* RILASCIO SETTLED -> WITHDRAWABLE */}
             <div className="grid grid-cols-3 gap-2 pt-1">
@@ -750,6 +1044,17 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   placeholder="Haircut (es. 1.0)"
                   className="rounded-lg bg-[#091224] border border-white/15 px-2.5 py-1.5 text-xs font-mono text-white"
                 />
+                <select
+                  value={batchReceivedAsset}
+                  onChange={(e) => setBatchReceivedAsset(e.target.value)}
+                  className="rounded-lg bg-[#091224] border border-white/15 px-2.5 py-1.5 text-xs font-mono text-white"
+                >
+                  {['USDT', 'USDC', 'TON', 'SOL', 'PI', 'CASH_AIRTM', 'CASH_PAYEER', 'CASH_VOLET'].map((a) => (
+                    <option key={a} value={a}>
+                      Asset Incasso: {a}
+                    </option>
+                  ))}
+                </select>
               </div>
               <button
                 type="button"
@@ -968,7 +1273,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 Regole Contabili PostgreSQL (Sola Lettura)
               </h3>
               <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/35 text-[10px] font-mono font-black text-emerald-300">
-                HARDENED 008–012
+                HARDENED 008–014
               </span>
             </div>
 
@@ -983,14 +1288,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   label: 'Regole Coefficienti PPP',
                   value: 'US = 1.0 • Europa = 1.0 • World Bank PA.NUS.PRVT.PP / PA.NUS.FCRF',
                 },
-                { label: 'Soglia Minima Prelievo', value: '500 PT ($5.00 USD)' },
+                { label: 'Soglia Minima Prelievo', value: '500 PT ($5.00 USD) • Doppia Approvazione >= 5000 PT' },
                 {
-                  label: 'Asset Abilitati on PostgreSQL',
-                  value: 'TON, SOL, PI, USDT, USDC, CASH_AIRTM/PAYEER/VOLET',
+                  label: 'Tesoreria & Payout (M1-M5)',
+                  value: 'MANUAL_EXTERNAL • Capacità isolata per TON, SOL, PI, USDT, USDC, CASH',
                 },
-                { label: 'Riserva Treasury (Solvibilità)', value: '15% fail-closed (v_treasury_solvency)' },
-                { label: 'Protezione Anti-Abuso', value: '3-Strike (1=OK, 2=WARN, 3=BLOCK)' },
-                { label: 'Blocco Paese Economico', value: 'Persistente su core.users (migrazioni 011–012)' },
+                { label: 'Riserva Treasury (Solvibilità)', value: '15% per singolo asset (v_treasury_vault_status)' },
+                { label: 'Protezione Anti-Abuso', value: '3-Strike + Kill Switch Globale + Verifica Tx On-Chain' },
+                { label: 'Blocco Paese Economico', value: 'Persistente su core.users (migrazioni 011–014)' },
               ].map((policy) => (
                 <div
                   key={policy.label}

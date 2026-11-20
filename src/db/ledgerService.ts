@@ -784,7 +784,7 @@ export class LedgerService {
     requestId: string,
     approvedBy: string,
     note?: string
-  ): Promise<{ ok: boolean; payout?: any; error?: string }> {
+  ): Promise<{ ok: boolean; idempotent?: boolean; requires_second_approval?: boolean; payout?: any; error?: string }> {
     if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
     const res = await pool.query(`SELECT core.approve_payout_atomic($1, $2, $3) AS result`, [
       requestId,
@@ -949,4 +949,506 @@ export class LedgerService {
     const res = await pool.query(`SELECT core.audit_ledger_integrity() AS result`);
     return res.rows[0]?.result;
   }
+
+  static async getPayoutById(requestId: string): Promise<any | null> {
+    if (!pool) return null;
+    const res = await pool.query(
+      `SELECT request_id, user_id, points, amount_usd::float8 AS amount_usd,
+              amount_ton::float8 AS amount_ton, COALESCE(asset_amount, amount_ton)::float8 AS asset_amount,
+              crypto_asset, payout_channel, wallet_address, status, payout_status, tx_hash,
+              requires_dual_approval, first_approved_by, second_approved_by
+         FROM core.payout_requests
+        WHERE request_id = $1
+        LIMIT 1`,
+      [requestId]
+    );
+    return res.rows[0] || null;
+  }
+
+  static async getKillSwitchStatus(): Promise<{
+    is_enabled: boolean;
+    reason: string;
+    updated_by?: string;
+    updated_at?: string;
+  }> {
+    if (!pool) {
+      return { is_enabled: true, reason: 'POSTGRES_UNAVAILABLE_FAIL_CLOSED' };
+    }
+    try {
+      const res = await pool.query(`SELECT core.get_payout_kill_switch() AS result`);
+      const row = res.rows[0]?.result;
+      if (!row || typeof row.is_enabled !== 'boolean') {
+        return { is_enabled: true, reason: 'KILL_SWITCH_STATUS_INVALID_FAIL_CLOSED' };
+      }
+      return row;
+    } catch {
+      return { is_enabled: true, reason: 'KILL_SWITCH_QUERY_ERROR_FAIL_CLOSED' };
+    }
+  }
+
+  static async setKillSwitchStatus(
+    enabled: boolean,
+    reason?: string,
+    updatedBy = 'admin'
+  ): Promise<{ ok: boolean; is_enabled?: boolean; reason?: string; updated_by?: string; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(`SELECT core.set_payout_kill_switch($1, $2, $3) AS result`, [
+        Boolean(enabled),
+        reason || null,
+        updatedBy || 'admin',
+      ]);
+      return res.rows[0]?.result || { ok: false, error: 'KILL_SWITCH_UPDATE_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'KILL_SWITCH_SQL_ERROR' };
+    }
+  }
+
+  static async getFinancialLimits(): Promise<Record<string, any> | null> {
+    if (!pool) return null;
+    try {
+      const res = await pool.query(
+        `SELECT metadata FROM core.system_controls WHERE control_key = 'PAYOUT_FINANCIAL_LIMITS' LIMIT 1`
+      );
+      return res.rows[0]?.metadata || null;
+    } catch {
+      return null;
+    }
+  }
+
+  static async revokeRewardPostback(
+    eventId: string,
+    reason = 'PARTNER_CHARGEBACK'
+  ): Promise<{ ok: boolean; idempotent?: boolean; status?: string; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(`SELECT core.revoke_settled_reward($1, $2) AS result`, [
+        eventId,
+        reason,
+      ]);
+      const r = res.rows[0]?.result || {};
+      return {
+        ok: Boolean(r.ok ?? r.success),
+        idempotent: Boolean(r.idempotent),
+        status: r.status || r.action,
+        error: r.error,
+      };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'REVOKE_POSTBACK_ERROR' };
+    }
+  }
+
+  static async reverseCompletedPayout(
+    requestId: string,
+    reason: string,
+    adminActor = 'admin'
+  ): Promise<{ ok: boolean; idempotent?: boolean; payout?: any; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(`SELECT core.reverse_completed_payout($1, $2, $3) AS result`, [
+        requestId,
+        reason,
+        adminActor,
+      ]);
+      return res.rows[0]?.result || { ok: false, error: 'PAYOUT_REVERSAL_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'PAYOUT_REVERSAL_SQL_ERROR' };
+    }
+  }
+
+  static async recordTreasuryConversion(params: {
+    conversionId: string;
+    fromAsset: string;
+    toAsset: string;
+    amountUsd: number;
+    fxRate?: number;
+    externalTxRef?: string;
+    recordedBy?: string;
+    note?: string;
+  }): Promise<{ ok: boolean; error?: string; [key: string]: any }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.record_treasury_conversion($1, $2, $3, $4, $5, $6, $7, $8) AS result`,
+        [
+          params.conversionId,
+          params.fromAsset,
+          params.toAsset,
+          params.amountUsd,
+          params.fxRate ?? 1.0,
+          params.externalTxRef || null,
+          params.recordedBy || 'owner',
+          params.note || null,
+        ]
+      );
+      return res.rows[0]?.result || { ok: false, error: 'TREASURY_CONVERSION_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'TREASURY_CONVERSION_SQL_ERROR' };
+    }
+  }
+
+  static async logInboundSecurityEvent(params: {
+    endpoint: string;
+    providerId?: string | null;
+    userId?: number | null;
+    anomalyCategory:
+      | 'TECHNICAL_ERROR'
+      | 'SUSPICIOUS_BEHAVIOR'
+      | 'REPLAY_ATTEMPT'
+      | 'INVALID_SIGNATURE'
+      | 'UNAUTHORIZED_URL'
+      | 'FRAUDULENT_ACTIVITY';
+    errorCode: string;
+    sourceIp?: string | null;
+    details?: Record<string, unknown>;
+  }): Promise<void> {
+    if (!pool) return;
+    try {
+      await pool.query(
+        `SELECT core.log_inbound_security_event($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [
+          params.endpoint,
+          params.providerId || null,
+          params.userId && Number.isFinite(params.userId) && params.userId > 0
+            ? Math.floor(params.userId)
+            : null,
+          params.anomalyCategory,
+          params.errorCode,
+          params.sourceIp || null,
+          JSON.stringify(params.details || {}),
+        ]
+      );
+    } catch {
+      // Non-blocking audit logging: fail-safe se tabella 015 non ancora applicata
+    }
+  }
+
+  static async getInboundSecurityLogs(limit = 50, category?: string): Promise<any[]> {
+    if (!pool) return [];
+    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+    try {
+      if (category) {
+        const res = await pool.query(
+          `SELECT log_id, endpoint, provider_id, user_id, anomaly_category, error_code,
+                  source_ip, details_json, created_at
+             FROM core.inbound_security_logs
+            WHERE anomaly_category = $1
+            ORDER BY created_at DESC
+            LIMIT $2`,
+          [category.trim().toUpperCase(), safeLimit]
+        );
+        return res.rows;
+      }
+      const res = await pool.query(
+        `SELECT log_id, endpoint, provider_id, user_id, anomaly_category, error_code,
+                source_ip, details_json, created_at
+           FROM core.inbound_security_logs
+          ORDER BY created_at DESC
+          LIMIT $1`,
+        [safeLimit]
+      );
+      return res.rows;
+    } catch {
+      return [];
+    }
+  }
+
+  static async revokeAutoSession(
+    sessionId: string,
+    reason = 'ADMIN_REVOKED',
+    actor = 'admin'
+  ): Promise<{ ok: boolean; idempotent?: boolean; session?: any; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(`SELECT core.revoke_auto_session($1, $2, $3) AS result`, [
+        sessionId,
+        reason,
+        actor,
+      ]);
+      return res.rows[0]?.result || { ok: false, error: 'AUTO_SESSION_REVOKE_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'AUTO_SESSION_REVOKE_SQL_ERROR' };
+    }
+  }
+
+  static async consumeProviderRateLimit(
+    providerId: string,
+    endpoint = 'default',
+    defaultRpm = 10
+  ): Promise<{
+    ok: boolean;
+    allowed: boolean;
+    limit: number;
+    remaining: number;
+    currentCount: number;
+    mode: 'POSTGRES_PERSISTENT' | 'POSTGRES_UNAVAILABLE_FAIL_CLOSED';
+    error?: string;
+  }> {
+    if (!pool) {
+      return {
+        ok: false,
+        allowed: false,
+        limit: defaultRpm,
+        remaining: 0,
+        currentCount: 0,
+        mode: 'POSTGRES_UNAVAILABLE_FAIL_CLOSED',
+        error: 'POSTGRES_UNAVAILABLE',
+      };
+    }
+    try {
+      const res = await pool.query(
+        `SELECT core.consume_provider_rate_limit($1, $2, $3) AS result`,
+        [providerId, endpoint, defaultRpm]
+      );
+      const r = res.rows[0]?.result || {};
+      return {
+        ok: true,
+        allowed: Boolean(r.allowed),
+        limit: Number(r.limit ?? defaultRpm),
+        remaining: Number(r.remaining ?? 0),
+        currentCount: Number(r.current_count ?? 0),
+        mode: 'POSTGRES_PERSISTENT',
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        allowed: false,
+        limit: defaultRpm,
+        remaining: 0,
+        currentCount: 0,
+        mode: 'POSTGRES_UNAVAILABLE_FAIL_CLOSED',
+        error: err?.message || 'RATE_LIMIT_SQL_ERROR',
+      };
+    }
+  }
+
+  static async setProviderRateLimit(
+    providerId: string,
+    requestsPerMinute: number,
+    actor = 'admin'
+  ): Promise<{ ok: boolean; config?: any; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.set_provider_rate_limit($1, $2, $3) AS result`,
+        [providerId, Math.floor(requestsPerMinute), actor]
+      );
+      return res.rows[0]?.result || { ok: false, error: 'RATE_LIMIT_UPDATE_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'RATE_LIMIT_UPDATE_SQL_ERROR' };
+    }
+  }
+
+  static async reviewProviderAnomalies(
+    providerId: string,
+    newStatus: 'ACTIVE' | 'WARNING' | 'QUARANTINE' | 'BANNED' = 'ACTIVE',
+    reason = 'ADMIN_QUARANTINE_LIFTED',
+    actor = 'admin'
+  ): Promise<{ ok: boolean; provider?: any; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.admin_review_provider_anomalies($1, $2, $3, $4) AS result`,
+        [providerId, newStatus, reason, actor]
+      );
+      return res.rows[0]?.result || { ok: false, error: 'PROVIDER_REVIEW_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'PROVIDER_REVIEW_SQL_ERROR' };
+    }
+  }
+
+  static async getProviderProtectionThresholds(): Promise<{
+    ok: boolean;
+    warning_threshold: number;
+    quarantine_threshold: number;
+    ban_admin_only: boolean;
+    source: 'POSTGRES' | 'DEFAULT_OFFLINE';
+  }> {
+    if (!pool) {
+      return {
+        ok: false,
+        warning_threshold: 3,
+        quarantine_threshold: 5,
+        ban_admin_only: true,
+        source: 'DEFAULT_OFFLINE',
+      };
+    }
+    try {
+      const res = await pool.query(
+        `SELECT metadata FROM core.system_controls WHERE control_key = 'PROVIDER_PROTECTION_THRESHOLDS' LIMIT 1`
+      );
+      const m = res.rows[0]?.metadata || {};
+      return {
+        ok: true,
+        warning_threshold: Number(m.warning_threshold ?? 3),
+        quarantine_threshold: Number(m.quarantine_threshold ?? 5),
+        ban_admin_only: Boolean(m.ban_admin_only ?? true),
+        source: 'POSTGRES',
+      };
+    } catch {
+      return {
+        ok: false,
+        warning_threshold: 3,
+        quarantine_threshold: 5,
+        ban_admin_only: true,
+        source: 'DEFAULT_OFFLINE',
+      };
+    }
+  }
+
+  static async updateProviderProtectionThresholds(
+    warningThreshold: number,
+    quarantineThreshold: number,
+    actor = 'admin'
+  ): Promise<{ ok: boolean; error?: string; [key: string]: any }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.update_provider_protection_thresholds($1, $2, $3) AS result`,
+        [Math.floor(warningThreshold), Math.floor(quarantineThreshold), actor]
+      );
+      return res.rows[0]?.result || { ok: false, error: 'THRESHOLDS_UPDATE_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'THRESHOLDS_UPDATE_SQL_ERROR' };
+    }
+  }
+
+  static async recordPayoutOnchainVerification(params: {
+    requestId: string;
+    asset: string;
+    network: string;
+    txHash: string;
+    destinationAddress: string;
+    expectedAmountAsset: number;
+    observedAmountAsset?: number | null;
+    confirmations?: number | null;
+    commitmentLevel?: string | null;
+    verified?: boolean;
+    verifiedBy?: string;
+    rawProof?: Record<string, unknown>;
+  }): Promise<{ ok: boolean; verification?: any; error?: string }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.record_payout_onchain_verification($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb) AS result`,
+        [
+          params.requestId,
+          params.asset,
+          params.network,
+          params.txHash,
+          params.destinationAddress,
+          Number(params.expectedAmountAsset || 0),
+          params.observedAmountAsset ?? null,
+          params.confirmations ?? null,
+          params.commitmentLevel ?? null,
+          params.verified ?? true,
+          params.verifiedBy || 'onchain_verifier',
+          JSON.stringify(params.rawProof || {}),
+        ]
+      );
+      return res.rows[0]?.result || { ok: false, error: 'ONCHAIN_PROOF_RECORD_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'ONCHAIN_PROOF_RECORD_SQL_ERROR' };
+    }
+  }
+
+  static async claimPayoutForDispatch(params: {
+    requestId: string;
+    workerId: string;
+    attemptId?: string;
+  }): Promise<{
+    ok: boolean;
+    attempt_id?: string;
+    request_id?: string;
+    payout?: any;
+    dispatch_state?: string;
+    active_attempt_id?: string;
+    tx_hash?: string;
+    error?: string;
+  }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.claim_payout_for_dispatch($1, $2, $3) AS result`,
+        [params.requestId, params.workerId, params.attemptId || null]
+      );
+      return res.rows[0]?.result || { ok: false, error: 'PAYOUT_CLAIM_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'PAYOUT_CLAIM_SQL_ERROR' };
+    }
+  }
+
+  static async updatePayoutDispatchState(params: {
+    requestId: string;
+    attemptId: string;
+    nextState:
+      | 'BROADCASTING'
+      | 'UNCERTAIN_TIMEOUT'
+      | 'CONFIRMED_ONCHAIN'
+      | 'FAILED_SAFE_RETRYABLE'
+      | 'COMPLETED';
+    actor?: string;
+    txHash?: string | null;
+    reason?: string | null;
+    chainSeqno?: number | null;
+    metadata?: Record<string, unknown>;
+  }): Promise<{
+    ok: boolean;
+    idempotent?: boolean;
+    attempt_id?: string;
+    from_state?: string;
+    dispatch_state?: string;
+    tx_hash?: string | null;
+    error?: string;
+  }> {
+    if (!pool) return { ok: false, error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.update_payout_dispatch_state($1, $2, $3, $4, $5, $6, $7, $8::jsonb) AS result`,
+        [
+          params.requestId,
+          params.attemptId,
+          params.nextState,
+          params.actor || 'worker',
+          params.txHash || null,
+          params.reason || null,
+          params.chainSeqno ?? null,
+          JSON.stringify(params.metadata || {}),
+        ]
+      );
+      return res.rows[0]?.result || { ok: false, error: 'PAYOUT_DISPATCH_STATE_UPDATE_FAILED' };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'PAYOUT_DISPATCH_STATE_SQL_ERROR' };
+    }
+  }
+
+  static async getUncertainPayoutDispatches(
+    limit = 50,
+    staleSeconds = 90
+  ): Promise<{ ok: boolean; items: any[]; error?: string }> {
+    if (!pool) return { ok: false, items: [], error: 'POSTGRES_UNAVAILABLE' };
+    try {
+      const res = await pool.query(
+        `SELECT core.get_uncertain_payout_dispatches($1, $2) AS result`,
+        [Math.max(1, Math.min(200, Math.floor(limit))), Math.max(15, Math.floor(staleSeconds))]
+      );
+      const r = res.rows[0]?.result || {};
+      return {
+        ok: Boolean(r.ok),
+        items: Array.isArray(r.items) ? r.items : [],
+        error: r.error,
+      };
+    } catch (err: any) {
+      return { ok: false, items: [], error: err?.message || 'UNCERTAIN_DISPATCH_QUERY_ERROR' };
+    }
+  }
+}
+
+export interface PayoutDispatchStore {
+  getKillSwitchStatus: typeof LedgerService.getKillSwitchStatus;
+  claimPayoutForDispatch: typeof LedgerService.claimPayoutForDispatch;
+  updatePayoutDispatchState: typeof LedgerService.updatePayoutDispatchState;
+  getUncertainPayoutDispatches: typeof LedgerService.getUncertainPayoutDispatches;
+  recordPayoutOnchainVerification: typeof LedgerService.recordPayoutOnchainVerification;
+  completePayout: typeof LedgerService.completePayout;
 }

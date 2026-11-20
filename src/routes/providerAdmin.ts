@@ -35,6 +35,38 @@ router.get('/health/check', async (_req: Request, res: Response) => {
   }
 });
 
+router.get('/thresholds/config', async (_req: Request, res: Response) => {
+  try {
+    const { LedgerService } = await import('../db/ledgerService');
+    const cfg = await LedgerService.getProviderProtectionThresholds();
+    return res.json({ ok: true, thresholds: cfg });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/thresholds/config', async (req: Request, res: Response) => {
+  if (!dbPool) {
+    return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_PROVIDER_THRESHOLDS' });
+  }
+  const warningThreshold = Number(req.body?.warningThreshold);
+  const quarantineThreshold = Number(req.body?.quarantineThreshold);
+  if (!Number.isFinite(warningThreshold) || !Number.isFinite(quarantineThreshold)) {
+    return res.status(400).json({ ok: false, error: 'NUMERIC_THRESHOLDS_REQUIRED' });
+  }
+  const actor = String((req as Request & { adminActor?: string }).adminActor || 'admin');
+  const { LedgerService } = await import('../db/ledgerService');
+  const result = await LedgerService.updateProviderProtectionThresholds(
+    warningThreshold,
+    quarantineThreshold,
+    actor
+  );
+  if (!result.ok) {
+    return res.status(409).json(result);
+  }
+  return res.json(result);
+});
+
 router.get('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -141,6 +173,45 @@ router.post('/:id/status', async (req: Request, res: Response) => {
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+router.post('/:id/rate-limit', async (req: Request, res: Response) => {
+  if (!dbPool) {
+    return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_RATE_LIMIT' });
+  }
+  const { id } = req.params;
+  const rpm = Number(req.body?.requestsPerMinute);
+  if (!Number.isFinite(rpm) || rpm < 1 || rpm > 10000) {
+    return res.status(400).json({ ok: false, error: 'INVALID_RPM_RANGE_1_TO_10000' });
+  }
+  const actor = String((req as Request & { adminActor?: string }).adminActor || 'admin');
+  const { LedgerService } = await import('../db/ledgerService');
+  const result = await LedgerService.setProviderRateLimit(id, rpm, actor);
+  if (!result.ok) {
+    return res.status(409).json(result);
+  }
+  return res.json(result);
+});
+
+router.post('/:id/review', async (req: Request, res: Response) => {
+  if (!dbPool) {
+    return res.status(503).json({ ok: false, error: 'POSTGRES_REQUIRED_FOR_PROVIDER_REVIEW' });
+  }
+  const { id } = req.params;
+  const status = String(req.body?.status || 'ACTIVE').trim().toUpperCase() as ProviderStatus;
+  const validStatuses: ProviderStatus[] = ['ACTIVE', 'WARNING', 'QUARANTINE', 'BANNED'];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ ok: false, error: 'Status non valido' });
+  }
+  const reason = String(req.body?.reason || 'ADMIN_QUARANTINE_LIFTED').trim().slice(0, 200);
+  const actor = String((req as Request & { adminActor?: string }).adminActor || 'admin');
+  const { LedgerService } = await import('../db/ledgerService');
+  const result = await LedgerService.reviewProviderAnomalies(id, status, reason, actor);
+  if (!result.ok) {
+    const code = result.error === 'PROVIDER_NOT_FOUND' ? 404 : 409;
+    return res.status(code).json(result);
+  }
+  return res.json(result);
 });
 
 router.post('/:id/failover', async (req: Request, res: Response) => {
