@@ -17,7 +17,8 @@
     "test:brands": "node --import tsx scripts/verify-brand-logos.ts",
     "test:hardening": "node --import tsx scripts/verify-hardening.ts",
     "test:economics": "node --import tsx scripts/verify-economics.ts",
-    "test:neon": "node --import tsx scripts/verify-neon-live.ts"
+    "test:neon": "node --import tsx scripts/verify-neon-live.ts",
+    "staging:prepare": "node --import tsx scripts/prepare-staging.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

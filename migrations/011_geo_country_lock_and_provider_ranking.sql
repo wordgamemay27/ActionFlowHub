@@ -298,6 +298,10 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- 5. Vista prioritizzazione fornitori attivi per reputazione & storico
+ALTER TABLE core.provider_reputation
+    ADD COLUMN IF NOT EXISTS strikes_count INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_confirmed_events INTEGER NOT NULL DEFAULT 0;
+
 CREATE OR REPLACE VIEW core.v_prioritized_providers AS
 SELECT
     pr.provider_id,

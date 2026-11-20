@@ -9,7 +9,7 @@
 // reputazione ACTIVE su DB, compatibilita GEO e convenienza economica). ZERO accrediti a tempo.
 // ============================================================================
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Play,
   Pause,
@@ -19,6 +19,7 @@ import {
   ExternalLink,
   RefreshCw,
   Globe,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   CycleStreamCategory,
@@ -35,7 +36,8 @@ import {
 } from '../lib/geoEconomics';
 import { useTranslation } from '../lib/i18n';
 import { EXTRA_UI_LOCALIZATION } from '../lib/providerLocalization';
-import { openTrackedLink } from '../lib/affiliate';
+import { openTrackedLink, resolveCanonicalProviderId } from '../lib/affiliate';
+import { isSafeExternalHttpsUrl } from '../utils/navigation';
 import { getTelegramInitData } from '../services/api';
 
 export interface AutoInteractiveCycleEngineProps {
@@ -429,61 +431,115 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
 
   const [stepIndex, setStepIndex] = useState(0);
   const [stepElapsed, setStepElapsed] = useState(0);
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
+  const [sessionStatus, setSessionStatus] = useState<string>('IDLE');
+  const [sessionError, setSessionError] = useState<string | null>(null);
   const [interactions, setInteractions] = useState<TrackedInteractionRow[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [reputationMap, setReputationMap] = useState<Record<string, ProviderReputationSnapshot>>({});
+  const [reputationSource, setReputationSource] = useState<'LOADING' | 'POSTGRES' | 'CATALOG'>('LOADING');
+  const [authorizedProviderIds, setAuthorizedProviderIds] = useState<ReadonlySet<string> | null>(null);
   const [balances, setBalances] = useState({
     pending_points: 0,
     settled_points: 0,
     withdrawable_points: 0,
   });
+  const autoStartedSessionRef = useRef<string | null>(null);
 
-  // Carica mappa reputazione live (escludendo QUARANTINE / BANNED) per ordinamento automatico
+  // Carica mappa reputazione live e whitelist provider attivi (escludendo QUARANTINE / BANNED)
   useEffect(() => {
     let cancelled = false;
     fetch(`/api/providers/prioritized?country=${encodeURIComponent(normalizedCountry)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (!cancelled && data?.reputationMap && typeof data.reputationMap === 'object') {
-          setReputationMap(data.reputationMap);
+        if (cancelled) return;
+        if (data?.ok) {
+          setReputationSource(data.reputationSource === 'POSTGRES' ? 'POSTGRES' : 'CATALOG');
+          if (data.reputationMap && typeof data.reputationMap === 'object') {
+            setReputationMap(data.reputationMap);
+          }
+          if (Array.isArray(data.providers)) {
+            const authIds = new Set<string>();
+            for (const p of data.providers) {
+              const rawId = String(p?.id || '').trim().toLowerCase();
+              if (!rawId) continue;
+              authIds.add(rawId);
+              authIds.add(resolveCanonicalProviderId(rawId));
+            }
+            setAuthorizedProviderIds(authIds);
+          } else {
+            setAuthorizedProviderIds(new Set());
+          }
+        } else {
+          setReputationSource('POSTGRES');
+          setAuthorizedProviderIds(new Set());
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled) {
+          setReputationSource('POSTGRES');
+          setAuthorizedProviderIds(new Set());
+        }
+      });
     return () => {
       cancelled = true;
     };
   }, [normalizedCountry]);
 
-  const activePlaylist = useMemo(
-    () =>
-      buildPrioritizedAutoCycleSteps(
-        DEFAULT_CYCLE_STEPS,
-        selectedCategories,
-        normalizedCountry,
-        reputationMap
-      ),
-    [selectedCategories, normalizedCountry, reputationMap]
-  );
+  const activePlaylist = useMemo(() => {
+    if (reputationSource === 'LOADING') return [];
+    return buildPrioritizedAutoCycleSteps(
+      DEFAULT_CYCLE_STEPS,
+      selectedCategories,
+      normalizedCountry,
+      reputationMap,
+      {
+        requireRegisteredReputation: reputationSource === 'POSTGRES',
+        authorizedProviderIds,
+      }
+    );
+  }, [selectedCategories, normalizedCountry, reputationMap, reputationSource, authorizedProviderIds]);
 
-  const currentStep = activePlaylist[stepIndex % Math.max(1, activePlaylist.length)] || activePlaylist[0];
+  const currentStep =
+    activePlaylist.length > 0 ? activePlaylist[stepIndex % activePlaylist.length] : undefined;
 
   const syncAutoSessionState = useCallback(async (sid?: string | null) => {
     const initData = getTelegramInitData();
-    if (!initData) return;
+    if (!initData) {
+      setSessionActive(false);
+      setRunning(false);
+      return;
+    }
 
     try {
       const qs = sid ? `?sessionId=${encodeURIComponent(sid)}` : '';
       const res = await fetch(`/api/auto-session/status${qs}`, {
         headers: { 'X-Telegram-Init-Data': initData },
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          setSessionActive(false);
+          setRunning(false);
+          setSessionStatus('REVOKED');
+        }
+        return;
+      }
       const data = await res.json();
       if (data?.session?.session_id) {
+        const nextStatus = String(data.session.status || 'UNKNOWN');
+        const activeNow = nextStatus === 'ACTIVE';
         setSessionId(data.session.session_id);
-        setSessionActive(data.session.status === 'ACTIVE');
+        setSessionStatus(nextStatus);
+        setSessionActive(activeNow);
+        if (!activeNow) {
+          setRunning(false);
+          setSessionError(`SESSION_${nextStatus}`);
+        }
+      } else {
+        setSessionActive(false);
+        setRunning(false);
       }
       if (Array.isArray(data?.interactions)) {
         setInteractions(data.interactions);
@@ -510,6 +566,9 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
     const initData = getTelegramInitData();
     if (!initData) {
       setSessionActive(false);
+      setRunning(false);
+      setSessionStatus('AUTH_REQUIRED');
+      setSessionError('TELEGRAM_INIT_DATA_REQUIRED');
       return;
     }
 
@@ -530,8 +589,12 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
       .then((data) => {
         if (cancelled) return;
         if (data?.ok && data?.session?.session_id) {
+          const nextStatus = String(data.session.status || 'ACTIVE');
+          const activeNow = nextStatus === 'ACTIVE';
           setSessionId(data.session.session_id);
-          setSessionActive(true);
+          setSessionStatus(nextStatus);
+          setSessionActive(activeNow);
+          setSessionError(activeNow ? null : `SESSION_${nextStatus}`);
           if (Array.isArray(data.interactions)) setInteractions(data.interactions);
           if (data.counts) setCounts(data.counts);
           if (data.balances) {
@@ -541,14 +604,41 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
               withdrawable_points: Number(data.balances.withdrawable_points || 0),
             });
           }
+        } else {
+          setSessionActive(false);
+          setRunning(false);
+          setSessionStatus('BLOCKED');
+          setSessionError(String(data?.error || 'AUTO_SESSION_UNAVAILABLE'));
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled) {
+          setSessionActive(false);
+          setRunning(false);
+          setSessionStatus('OFFLINE');
+          setSessionError('AUTO_SESSION_NETWORK_ERROR');
+        }
+      });
 
     return () => {
       cancelled = true;
     };
   }, [autoStartTriggerKey, selectedCategories, normalizedCountry, lang]);
+
+  // Fail-closed: il motore ruota solo con sessione ACTIVE e almeno una campagna autorizzata
+  useEffect(() => {
+    if (
+      sessionActive &&
+      sessionId &&
+      activePlaylist.length > 0 &&
+      autoStartedSessionRef.current !== sessionId
+    ) {
+      autoStartedSessionRef.current = sessionId;
+      setRunning(true);
+    } else if (!sessionActive || activePlaylist.length === 0) {
+      setRunning(false);
+    }
+  }, [sessionActive, sessionId, activePlaylist.length]);
 
   // Polling periodico stato postback partner reali da PostgreSQL
   useEffect(() => {
@@ -561,7 +651,7 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
 
   // Rotazione automatica visuale delle attivita' nella coda (solo UI stepper, ZERO crediti temporali)
   useEffect(() => {
-    if (!running || !currentStep) return;
+    if (!running || !sessionActive || !currentStep || activePlaylist.length === 0) return;
     const timer = setInterval(() => {
       setStepElapsed((prev) => {
         if (prev + 1 >= currentStep.durationSec) {
@@ -572,15 +662,16 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [running, currentStep, activePlaylist.length]);
+  }, [running, sessionActive, currentStep, activePlaylist.length]);
 
   const handleLaunchInteraction = () => {
-    if (!currentStep) return;
+    if (!sessionActive || !sessionId || !currentStep) return;
+    if (!isSafeExternalHttpsUrl(currentStep.targetUrl)) return;
     openTrackedLink(currentStep.targetUrl, {
       partnerId: currentStep.canonicalProviderId || currentStep.providerId,
       taskId: currentStep.id,
       activityCategory: currentStep.activityCategory,
-      sessionId: sessionId || undefined,
+      sessionId,
       telegramId: telegramUserId,
       kind: 'TASK',
     });
@@ -655,34 +746,53 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
         </div>
       </div>
 
-      {/* Attività Corrente del Ciclo Prioritizzato */}
-      {currentStep && (
-        <div className="rounded-xl bg-[#0A1326] border border-sky-400/20 p-2.5 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <Layers className="w-4 h-4 text-sky-400 shrink-0" />
-            <div className="min-w-0">
-              <div className="text-xs font-black text-white truncate">{localizedStepTitle}</div>
-              <div className="text-[10px] font-mono text-slate-400 truncate">
-                {currentStep.providerLabel} • {localizedCategoryLabel}
-              </div>
-              <div className="text-[9px] font-mono text-emerald-300/90 truncate">
-                {currentStep.noRestriction ? 'GLOBAL (No-Tier)' : currentStep.geoRegion} • ~{currentStep.estimatedMinutes} min
-                {typeof currentStep.completionRate === 'number'
-                  ? ` • ${(currentStep.completionRate * 100).toFixed(0)}% OK`
-                  : ''}{' '}
-                • {currentStep.payoutInfo || 'S2S Verificato'}
-              </div>
+      {/* Attività Corrente del Ciclo Prioritizzato (Fail-Closed se non attiva o senza campagne) */}
+      {(!sessionActive || activePlaylist.length === 0) ? (
+        <div className="rounded-xl bg-amber-950/40 border border-amber-400/35 p-3 flex items-start gap-2 text-xs text-amber-200">
+          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <div className="font-black uppercase tracking-wide text-[11px]">
+              Motore in attesa di autorizzazione backend ({sessionStatus})
+            </div>
+            <div className="text-[11px] font-mono text-amber-200/80">
+              {reputationSource === 'LOADING'
+                ? 'Verifica reputazione fornitori e campagne attive in corso...'
+                : activePlaylist.length === 0
+                ? 'Nessuna campagna attiva/autorizzata compatibile trovata per il Paese o le categorie selezionate.'
+                : sessionError || 'Sessione automatica non attiva o revocata su PostgreSQL.'}
             </div>
           </div>
-          <button
-            type="button"
-            onClick={handleLaunchInteraction}
-            className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-gradient-to-r from-sky-500 to-cyan-400 text-slate-950 text-[10px] font-black uppercase cursor-pointer active:scale-95"
-          >
-            <span>Esegui</span>
-            <ExternalLink className="w-3 h-3" />
-          </button>
         </div>
+      ) : (
+        currentStep && (
+          <div className="rounded-xl bg-[#0A1326] border border-sky-400/20 p-2.5 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <Layers className="w-4 h-4 text-sky-400 shrink-0" />
+              <div className="min-w-0">
+                <div className="text-xs font-black text-white truncate">{localizedStepTitle}</div>
+                <div className="text-[10px] font-mono text-slate-400 truncate">
+                  {currentStep.providerLabel} • {localizedCategoryLabel}
+                </div>
+                <div className="text-[9px] font-mono text-emerald-300/90 truncate">
+                  {currentStep.noRestriction ? 'GLOBAL (No-Tier)' : currentStep.geoRegion} • ~{currentStep.estimatedMinutes} min
+                  {typeof currentStep.completionRate === 'number'
+                    ? ` • ${(currentStep.completionRate * 100).toFixed(0)}% OK`
+                    : ''}{' '}
+                  • {currentStep.payoutInfo || 'S2S Verificato'}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleLaunchInteraction}
+              disabled={!sessionActive || !currentStep}
+              className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-gradient-to-r from-sky-500 to-cyan-400 text-slate-950 text-[10px] font-black uppercase cursor-pointer active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <span>Esegui</span>
+              <ExternalLink className="w-3 h-3" />
+            </button>
+          </div>
+        )
       )}
 
       {/* Barra Rotazione Attivita' (solo visiva, zero crediti a tempo) */}
@@ -726,8 +836,11 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
       <div className="flex items-center justify-between gap-2">
         <button
           type="button"
-          onClick={() => setRunning((r) => !r)}
-          className="flex-1 py-2.5 px-3 rounded-xl bg-sky-500/20 border border-sky-400/30 text-xs font-black uppercase text-white flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
+          onClick={() => {
+            if (sessionActive && activePlaylist.length > 0) setRunning((r) => !r);
+          }}
+          disabled={!sessionActive || activePlaylist.length === 0}
+          className="flex-1 py-2.5 px-3 rounded-xl bg-sky-500/20 border border-sky-400/30 text-xs font-black uppercase text-white flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {running ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
           <span>{running ? t.ui.pauseBtn : t.ui.resumeBtn}</span>
@@ -735,10 +848,12 @@ export const AutoInteractiveCycleEngine: React.FC<AutoInteractiveCycleEngineProp
         <button
           type="button"
           onClick={() => {
+            if (!sessionActive || activePlaylist.length === 0) return;
             setStepIndex((idx) => (idx + 1) % Math.max(1, activePlaylist.length));
             setStepElapsed(0);
           }}
-          className="py-2.5 px-3 rounded-xl bg-slate-800/80 border border-white/10 text-xs font-black uppercase text-sky-300 cursor-pointer"
+          disabled={!sessionActive || activePlaylist.length === 0}
+          className="py-2.5 px-3 rounded-xl bg-slate-800/80 border border-white/10 text-xs font-black uppercase text-sky-300 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
         >
           Prossima
         </button>

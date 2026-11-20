@@ -507,7 +507,11 @@ async function testMultiAssetFailClosed() {
     assert.equal(res.ok, false, `${asset} dispatch must fail closed without DB/credentials`);
     assert.equal(res.txHash, undefined, `${asset} dispatch must never fabricate txHash`);
   }
-  assert.equal(workers.multiAssetPayout.getStatus().simulatedHashesDisabled, true);
+  const maStatus = workers.multiAssetPayout.getStatus();
+  assert.equal(maStatus.simulatedHashesDisabled, true);
+  assert.equal(maStatus.payoutExecutionMode, 'MANUAL_EXTERNAL');
+  assert.equal(maStatus.serverKeyCustodyDisabled, true);
+  assert.equal(maStatus.perAssetVaultIsolationEnabled, true);
 }
 
 async function testEconomicsAndProvidersEndpoints() {

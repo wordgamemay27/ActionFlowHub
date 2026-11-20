@@ -41,13 +41,11 @@ export function getTelegramInitDataHeader(): string {
 }
 
 export function newClickId(): string {
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `clk_${Date.now().toString(36)}_${rand}`;
+  return `clk_${globalThis.crypto.randomUUID().replace(/-/g, '')}`;
 }
 
 export function newInteractionId(): string {
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `int_${Date.now().toString(36)}_${rand}`;
+  return `int_${globalThis.crypto.randomUUID().replace(/-/g, '')}`;
 }
 
 export function buildAffiliateUrl(
@@ -106,7 +104,6 @@ const REGISTERED_PROVIDERS = new Set([
   'gaijin',
   'submithub',
   'fountain',
-  'cpx',
   'prolific',
   'outlier',
   'premise',
@@ -137,7 +134,6 @@ export function resolveCanonicalProviderId(
   if (clean.includes('gaijin')) return 'gaijin';
   if (clean.includes('submithub')) return 'submithub';
   if (clean.includes('fountain')) return 'fountain';
-  if (clean.includes('cpx')) return 'cpx';
   if (clean.includes('prolific')) return 'prolific';
   if (clean.includes('outlier')) return 'outlier';
   if (clean.includes('premise')) return 'premise';
@@ -152,7 +148,7 @@ export function resolveCanonicalProviderId(
   if (cat === 'VIDEO') return 'video_stream';
   if (cat === 'MUSIC') return 'music_player';
   if (cat === 'GAME') return 'plarium';
-  if (cat === 'SURVEY') return 'cpx';
+  if (cat === 'SURVEY') return 'ads_network';
   if (cat === 'UX_QA') return 'prolific';
   if (cat === 'AI_TASK') return 'outlier';
   if (cat === 'RECEIPT') return 'premise';
