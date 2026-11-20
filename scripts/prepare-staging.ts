@@ -102,7 +102,11 @@ async function main() {
   });
 
   const rpcProbes = await Promise.all([
-    probeUrl('TON_RPC', process.env.TON_RPC || process.env.TONCENTER_RPC),
+    probeUrl('TON_RPC', process.env.TON_RPC || process.env.TONCENTER_RPC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getMasterchainInfo' }),
+    }),
     probeUrl('SOL_RPC', process.env.SOL_RPC || process.env.SOLANA_RPC_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
